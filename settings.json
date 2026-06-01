@@ -1,0 +1,17 @@
+{
+  "defaultModel": "opus",
+  "defaultMode": "answer",
+  "defaultBrevity": "short",
+  "maxContextChars": 12000,
+  "maxOutputChars": 4000,
+  "aliases": {
+    "opus": "anthropic/claude-opus-4-8",
+    "gpt": "openai-codex/gpt-5.5",
+    "opus47": "anthropic/claude-opus-4-7",
+    "mimo": "mimo/mimo-v2.5-pro",
+    "deepseek": "deepseek/deepseek-v4-pro",
+    "glm": "zai/glm-5.1",
+    "spark": "openai-codex/codex-5.3-spark",
+    "mm": "minimax/MiniMax-M2.7-highspeed"
+  }
+}
