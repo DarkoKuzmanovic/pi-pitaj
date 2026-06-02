@@ -1,5 +1,13 @@
 # PMTI changes log
 
+## 2026-06-01 — M3 consultation observability and budgets completed
+
+- Added answer-first `pitaj` result presentation with compact metadata footer for model, route, context source, snapshot categories, and sidecar no-tools/no-file-access boundaries.
+- Added in-memory current-session usage accounting plus `/pitaj usage` and `/pitaj usage reset`, including route/model/context counts, budget status, and sanitized error recording without prompt/context retention.
+- Added advisory inline warning integration for 3 low-risk/GPT-style consults, 3 high-risk/Opus-style consults, and 5 snapshot consults; warnings remain guidance only and do not block consults.
+- Documented result blocks, usage summaries, reset behavior, advisory thresholds, and sidecar limitations in README and `/pitaj help`.
+- Verified with `npm test`, strip import checks, Biome, guardrail audits, and fresh-context reviewer approvals through Batch A/B/C close-out.
+
 ## 2026-06-01 — M2 `/pitaj config` settings UI completed
 
 - Added `/pitaj config` and `/pitaj config show` settings summaries plus an interactive UI flow for common settings when Pi UI is available.

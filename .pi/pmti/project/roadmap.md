@@ -7,10 +7,10 @@ Detailed PMTI milestone scope, task decomposition, dependencies, and review stat
 - **M0:** Completed 2026-05-30 — MiniMax-friendly auto-routing contract for `pitaj`; see `.pi/pmti/milestones/M0.md`.
 - **M1:** Completed 2026-06-01 — curated snapshot consult mode with pure builder, bounded runtime seam, `/pitaj snapshot` command wiring, README/help docs, verification, and reviewer close-out; see `.pi/pmti/milestones/M1.md`.
 - **M2:** Completed 2026-06-01 — `/pitaj config` settings summary and UI-backed safe persistence with configurable auto-route aliases, max output precedence fix, documentation, verification, and reviewer close-out; see `.pi/pmti/milestones/M2.md`.
+- **M3:** Completed 2026-06-01 — consultation observability and budgets with answer-first result presentation, in-memory usage accounting, `/pitaj usage`, `/pitaj usage reset`, and advisory inline warning thresholds; see `.pi/pmti/milestones/M3.md`.
 
 ## Candidate milestones
 
-- **M3:** Consultation observability and budgets - surface per-task/session usage for GPT/Opus-style routes, warnings, and troubleshooting for overuse or too-little-context cases.
 - **M4:** Advisor-style shortcut polish — consider a zero-parameter convenience affordance only if it uses the M1 curated snapshot builder and clearly labels results as advisory.
 - **M5:** Explicit full-branch mode — optional parity with whole-branch advisor tools, guarded by explicit opt-in, token/sensitivity warnings, and existing context limits.
 

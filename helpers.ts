@@ -247,12 +247,18 @@ export function resolveAutoRoute(input: AutoRouteInput, settings: PitajSettings)
 	};
 }
 
-export type SpecialCommand = "help" | "aliases" | "models" | "check" | "snapshot" | "config" | "none";
+export type SpecialCommand = "help" | "aliases" | "models" | "check" | "snapshot" | "config" | "usage" | "auto" | "advise" | "none";
 
 export function classifySpecialCommand(input: string): SpecialCommand {
 	const normalized = input.trim().toLowerCase();
 	if (normalized === "config" || normalized.startsWith("config ")) {
 		return "config";
+	}
+	if (normalized === "auto" || normalized.startsWith("auto ")) {
+		return "auto";
+	}
+	if (normalized === "advise" || normalized.startsWith("advise ")) {
+		return "advise";
 	}
 	switch (normalized) {
 		case "help":
@@ -262,6 +268,9 @@ export function classifySpecialCommand(input: string): SpecialCommand {
 		case "aliases":
 		case "models":
 			return normalized as "aliases" | "models";
+		case "usage":
+		case "usage reset":
+			return "usage";
 		case "check":
 			return "check";
 		case "snapshot":
@@ -271,6 +280,24 @@ export function classifySpecialCommand(input: string): SpecialCommand {
 		default:
 			return "none";
 	}
+}
+
+export type AdviseFlagViolation = { forbiddenFlags: string[]; looksLikeModel: boolean };
+
+export function isAdviseFlagViolation(
+	adviseInput: string,
+	settings: PitajSettings,
+): AdviseFlagViolation {
+	const tokens = adviseInput.split(/\s+/);
+	const firstToken = tokens[0]?.toLowerCase();
+	const forbiddenFlags = ["--mode", "-m", "--brevity", "-b", "--context", "-c"];
+	const hasForbiddenFlags = forbiddenFlags.filter((f) => tokens.includes(f));
+	const looksLikeModel =
+		firstToken && (firstToken.includes("/") || settings.aliases[firstToken]);
+	return {
+		forbiddenFlags: hasForbiddenFlags,
+		looksLikeModel: Boolean(looksLikeModel),
+	};
 }
 
 export const BREVITY_OUTPUT_CHARS: Record<PitajBrevity, number> = {
@@ -534,4 +561,481 @@ export function buildConsultUserText(question: string, context: string | undefin
 	}
 	sections.push(`## Question\n\n${question.trim()}`);
 	return sections.join("\n\n");
+}
+
+// --- M3-T1 result block foundation (Batch A) --------------------------------
+
+/**
+ * Structural input for the pure result formatter. Mirrors only the fields
+ * needed to render the user-visible `pitaj` consultation result block.
+ *
+ * Kept separate from `index.ts` `PitajResultDetails` so `helpers.ts` does not
+ * import from `index.ts` and so the formatter is unit-testable without
+ * registering the Pi extension.
+ */
+export interface PitajResultDisplaySnapshot {
+	includedCategories: readonly string[];
+	truncatedCategories: readonly string[];
+	omittedCategories: readonly string[];
+	truncated: boolean;
+}
+
+export interface PitajResultDisplayDetails {
+	model: string;
+	alias?: string;
+	mode: string;
+	brevity: string;
+	contextChars: number;
+	question?: string;
+	settingsPath?: string;
+	settingsWarning?: string;
+	stopReason?: string;
+	autoRouted?: boolean;
+	routingReason?: string;
+	autoSuggestedMode?: string;
+	snapshot?: PitajResultDisplaySnapshot;
+}
+
+export interface FormatResultOptions {
+	/**
+	 * Optional post-answer extension slot. Rendered as compact bullet lines
+	 * after the metadata footer. Designed for M3-T5 budget warnings to plug
+	 * into without reopening T1 core formatting tests.
+	 */
+	warnings?: readonly string[];
+	/**
+	 * When true, renders an "advisory" label in the footer snapshot metadata.
+	 */
+	isAdvisory?: boolean;
+}
+
+export function formatResultForDisplay(
+	answer: string,
+	details: PitajResultDisplayDetails,
+	options: FormatResultOptions = {},
+): string {
+	const sections: string[] = [];
+
+	const displayModel = details.model?.trim() || "unknown";
+	const displayAlias = details.alias?.trim();
+	const modelLabel = `${displayModel}${displayAlias ? ` (${displayAlias})` : ""}`;
+
+	const answerText = (answer ?? "").trimEnd() || "(pitaj returned no text)";
+	sections.push(answerText);
+
+	const footerLines: string[] = [`model: ${modelLabel}`];
+
+	const routeBits: string[] = [];
+	if (details.mode) routeBits.push(`mode=${details.mode}`);
+	if (details.brevity) routeBits.push(`brevity=${details.brevity}`);
+	if (details.autoRouted) {
+		routeBits.push("auto-routed");
+		if (details.routingReason) {
+			routeBits.push(`reason=${details.routingReason}`);
+		}
+	}
+	if (routeBits.length > 0) {
+		footerLines.push(`route: ${routeBits.join(" · ")}`);
+	}
+
+	if (details.snapshot) {
+		footerLines.push("context: snapshot");
+		const included = details.snapshot.includedCategories.length;
+		const truncatedCount = details.snapshot.truncatedCategories.length;
+		const omitted = details.snapshot.omittedCategories.length;
+		const totalChars = details.snapshot.truncated ? "truncated" : "ok";
+		const categoryList = describeCategoryList([
+			...details.snapshot.includedCategories.map((category) => `+${category}`),
+			...details.snapshot.truncatedCategories.map((category) => `~${category}`),
+			...details.snapshot.omittedCategories.map((category) => `-${category}`),
+		]);
+		footerLines.push(
+			`snapshot: included=${included}, truncated=${truncatedCount}, omitted=${omitted}, size=${totalChars} (${categoryList})`,
+		);
+	} else if (details.contextChars > 0) {
+		footerLines.push(`context: manual, ${details.contextChars} chars`);
+	} else {
+		footerLines.push("context: none");
+	}
+
+	if (options.isAdvisory) {
+		footerLines.push("advisory: true — advisory snapshot consult");
+	}
+
+	const warnings = options.warnings ?? [];
+	if (warnings.length > 0) {
+		for (const warning of warnings) {
+			if (warning?.trim()) footerLines.push(`warning: ${warning.trim()}`);
+		}
+	}
+
+	if (details.snapshot) {
+		footerLines.push("sidecar: no tools / no file access (snapshot context only)");
+	} else if (details.contextChars > 0) {
+		footerLines.push("sidecar: no tools / no file access (caller-provided context only)");
+	} else {
+		footerLines.push("sidecar: no tools / no file access (no context provided)");
+	}
+
+	if (footerLines.length > 0) {
+		sections.push("");
+		sections.push("---");
+		for (const line of footerLines) sections.push(line);
+	}
+
+	return sections.join("\n");
+}
+
+function describeCategoryList(items: readonly string[]): string {
+	if (items.length === 0) return "none";
+	return items.join(", ");
+}
+
+// --- M3-B2 usage accounting (Batch B) ---------------------------------------
+
+export type UsageContextSource = "none" | "manual" | "snapshot";
+
+export type UsageRouteKind =
+	| "auto-low"
+	| "auto-high"
+	| "auto-risk-check"
+	| "explicit-low"
+	| "explicit-high"
+	| "explicit-other"
+	| "snapshot"
+	| "error";
+
+export type UsageRisk = "low" | "high" | "none" | "unknown";
+
+export interface UsageEvent {
+	timestamp: number;
+	requestedModel: string;
+	resolvedModel: string;
+	resolvedAlias?: string;
+	autoRouted: boolean;
+	routeKind: UsageRouteKind;
+	mode: string;
+	brevity: string;
+	risk: UsageRisk;
+	contextSource: UsageContextSource;
+	contextChars: number;
+	maxOutputChars: number;
+	success: boolean;
+	truncated: boolean;
+}
+
+export const USAGE_BUDGET = {
+	lowRisk: 3,
+	highRisk: 3,
+	snapshot: 5,
+} as const;
+
+export type UsageBudgetGroup = "low-risk" | "high-risk" | "snapshot";
+
+export interface UsageBudgetState {
+	lowRisk: number;
+	highRisk: number;
+	snapshot: number;
+	lowRiskWarned: boolean;
+	highRiskWarned: boolean;
+	snapshotWarned: boolean;
+}
+
+export interface UsageStoreSnapshot {
+	events: readonly UsageEvent[];
+	totals: UsageBudgetState;
+}
+
+export interface UsageSummary {
+	total: number;
+	byRouteKind: Record<UsageRouteKind, number>;
+	byContext: Record<UsageContextSource, number>;
+	byRisk: Record<UsageRisk, number>;
+	byModel: Record<string, number>;
+	errors: number;
+	budget: UsageBudgetState;
+	warningsReached: UsageBudgetGroup[];
+	budgetStatus: "ok" | "warning";
+}
+
+export function createUsageStore(): {
+	record: (event: UsageEvent) => void;
+	snapshot: () => UsageStoreSnapshot;
+	reset: () => void;
+} {
+	const events: UsageEvent[] = [];
+	const totals: UsageBudgetState = {
+		lowRisk: 0,
+		highRisk: 0,
+		snapshot: 0,
+		lowRiskWarned: false,
+		highRiskWarned: false,
+		snapshotWarned: false,
+	};
+
+	function record(event: UsageEvent): void {
+		events.push(event);
+		if (!event.success) return;
+		if (event.contextSource === "snapshot") {
+			totals.snapshot += 1;
+			if (!totals.snapshotWarned && totals.snapshot >= USAGE_BUDGET.snapshot) {
+				totals.snapshotWarned = true;
+			}
+			return;
+		}
+		if (event.risk === "low") {
+			totals.lowRisk += 1;
+			if (!totals.lowRiskWarned && totals.lowRisk >= USAGE_BUDGET.lowRisk) {
+				totals.lowRiskWarned = true;
+			}
+		} else if (event.risk === "high") {
+			totals.highRisk += 1;
+			if (!totals.highRiskWarned && totals.highRisk >= USAGE_BUDGET.highRisk) {
+				totals.highRiskWarned = true;
+			}
+		}
+	}
+
+	function snapshot(): UsageStoreSnapshot {
+		return { events: [...events], totals: { ...totals } };
+	}
+
+	function reset(): void {
+		events.length = 0;
+		totals.lowRisk = 0;
+		totals.highRisk = 0;
+		totals.snapshot = 0;
+		totals.lowRiskWarned = false;
+		totals.highRiskWarned = false;
+		totals.snapshotWarned = false;
+	}
+
+	return { record, snapshot, reset };
+}
+
+function inferUsageRiskFromModel(input: {
+	requestedModel?: string;
+	resolvedModel: string;
+	resolvedAlias?: string;
+}): UsageRisk {
+	const label = [input.requestedModel, input.resolvedAlias, input.resolvedModel].filter(Boolean).join(" ").toLowerCase();
+	if (label.includes("opus") || label.includes("claude-opus")) return "high";
+	if (label.includes("gpt") || label.includes("openai-codex")) return "low";
+	return "unknown";
+}
+
+export function classifyUsageEvent(input: {
+	requestedModel?: string;
+	resolvedModel: string;
+	resolvedAlias?: string;
+	autoRouted: boolean;
+	risk?: PitajAutoRisk;
+	mode?: string;
+	success: boolean;
+	contextSource: UsageContextSource;
+}): { routeKind: UsageRouteKind; risk: UsageRisk } {
+	if (!input.success) {
+		return { routeKind: "error", risk: "none" };
+	}
+	if (input.contextSource === "snapshot") {
+		return { routeKind: "snapshot", risk: "none" };
+	}
+	const mode = (input.mode ?? "").toLowerCase();
+	const riskHint = input.risk;
+	if (input.autoRouted) {
+		if (mode === "risk-check") {
+			return { routeKind: "auto-risk-check", risk: "high" };
+		}
+		if (riskHint === "high") {
+			return { routeKind: "auto-high", risk: "high" };
+		}
+		return { routeKind: "auto-low", risk: "low" };
+	}
+	if (mode === "risk-check" || riskHint === "high") {
+		return { routeKind: "explicit-high", risk: "high" };
+	}
+	if (riskHint === "low") {
+		return { routeKind: "explicit-low", risk: "low" };
+	}
+	const inferredRisk = inferUsageRiskFromModel(input);
+	if (inferredRisk === "high") return { routeKind: "explicit-high", risk: "high" };
+	if (inferredRisk === "low") return { routeKind: "explicit-low", risk: "low" };
+	return { routeKind: "explicit-other", risk: "unknown" };
+}
+
+export function detectContextSource(input: {
+	hasSnapshot: boolean;
+	contextChars: number;
+}): UsageContextSource {
+	if (input.hasSnapshot) return "snapshot";
+	if (input.contextChars > 0) return "manual";
+	return "none";
+}
+
+export function buildUsageSummary(snapshot: UsageStoreSnapshot): UsageSummary {
+	const byRouteKind: Record<UsageRouteKind, number> = {
+		"auto-low": 0,
+		"auto-high": 0,
+		"auto-risk-check": 0,
+		"explicit-low": 0,
+		"explicit-high": 0,
+		"explicit-other": 0,
+		snapshot: 0,
+		error: 0,
+	};
+	const byContext: Record<UsageContextSource, number> = {
+		none: 0,
+		manual: 0,
+		snapshot: 0,
+	};
+	const byRisk: Record<UsageRisk, number> = {
+		low: 0,
+		high: 0,
+		none: 0,
+		unknown: 0,
+	};
+	const byModel: Record<string, number> = {};
+	let errors = 0;
+
+	for (const event of snapshot.events) {
+		byRouteKind[event.routeKind] += 1;
+		byContext[event.contextSource] += 1;
+		byRisk[event.risk] += 1;
+		const modelKey = event.resolvedAlias ? `${event.resolvedAlias} (${event.resolvedModel})` : event.resolvedModel || event.requestedModel || "unknown";
+		byModel[modelKey] = (byModel[modelKey] ?? 0) + 1;
+		if (!event.success) errors += 1;
+	}
+
+	const warningsReached: UsageBudgetGroup[] = [];
+	const { totals } = snapshot;
+	if (totals.lowRiskWarned) warningsReached.push("low-risk");
+	if (totals.highRiskWarned) warningsReached.push("high-risk");
+	if (totals.snapshotWarned) warningsReached.push("snapshot");
+
+	return {
+		total: snapshot.events.length,
+		byRouteKind,
+		byContext,
+		byRisk,
+		byModel,
+		errors,
+		budget: totals,
+		warningsReached,
+		budgetStatus: warningsReached.length > 0 ? "warning" : "ok",
+	};
+}
+
+export function applyUsageWarningFlags(totals: UsageBudgetState): UsageBudgetState {
+	const next: UsageBudgetState = { ...totals };
+	if (!next.lowRiskWarned && next.lowRisk >= USAGE_BUDGET.lowRisk) {
+		next.lowRiskWarned = true;
+	}
+	if (!next.highRiskWarned && next.highRisk >= USAGE_BUDGET.highRisk) {
+		next.highRiskWarned = true;
+	}
+	if (!next.snapshotWarned && next.snapshot >= USAGE_BUDGET.snapshot) {
+		next.snapshotWarned = true;
+	}
+	return next;
+	}
+
+/**
+ * Build compact advisory warning lines for inline display in a result block.
+ * Returns an empty array when no thresholds have been reached.
+ */
+export function buildInlineWarnings(totals: UsageBudgetState): readonly string[] {
+	const warnings: string[] = [];
+	if (totals.lowRiskWarned) {
+		warnings.push(
+			`You have sent ${totals.lowRisk} low-risk/GPT-style consult${totals.lowRisk === 1 ? "" : "s"} in this session. Run \`/pitaj usage\` for details or \`/pitaj usage reset\` to clear counters.`,
+		);
+	}
+	if (totals.highRiskWarned) {
+		warnings.push(
+			`You have sent ${totals.highRisk} high-risk/Opus-style consult${totals.highRisk === 1 ? "" : "s"} in this session. Run \`/pitaj usage\` for details or \`/pitaj usage reset\` to clear counters.`,
+		);
+	}
+	if (totals.snapshotWarned) {
+		warnings.push(
+			`You have sent ${totals.snapshot} snapshot consult${totals.snapshot === 1 ? "" : "s"} in this session. Snapshot consults are bounded but still context-heavy. Run \`/pitaj usage\` for details or \`/pitaj usage reset\` to clear counters.`,
+		);
+	}
+	return warnings;
+}
+
+export function describeRouteKind(kind: UsageRouteKind): string {
+	switch (kind) {
+		case "auto-low":
+			return "auto (low-risk)";
+		case "auto-high":
+			return "auto (high-risk)";
+		case "auto-risk-check":
+			return "auto risk-check";
+		case "explicit-low":
+			return "explicit (low-risk)";
+		case "explicit-high":
+			return "explicit (high-risk)";
+		case "explicit-other":
+			return "explicit (other)";
+		case "snapshot":
+			return "snapshot";
+		case "error":
+			return "error";
+	}
+}
+
+export function formatUsageSummaryText(summary: UsageSummary): string {
+	const lines: string[] = [];
+	lines.push("pitaj usage (current session)");
+	lines.push("");
+	lines.push(`total consults: ${summary.total}`);
+	lines.push(`errors: ${summary.errors}`);
+
+	const routeEntries = (Object.entries(summary.byRouteKind) as [UsageRouteKind, number][])
+		.filter(([, count]) => count > 0)
+		.sort(([a], [b]) => a.localeCompare(b));
+	if (routeEntries.length > 0) {
+		lines.push("");
+		lines.push("routes:");
+		for (const [kind, count] of routeEntries) {
+			lines.push(`  ${describeRouteKind(kind)}: ${count}`);
+		}
+	}
+
+	const modelEntries = Object.entries(summary.byModel).filter(([, count]) => count > 0).sort(([a], [b]) => a.localeCompare(b));
+	if (modelEntries.length > 0) {
+		lines.push("");
+		lines.push("models:");
+		for (const [model, count] of modelEntries) {
+			lines.push(`  ${model}: ${count}`);
+		}
+	}
+
+	const contextEntries = (Object.entries(summary.byContext) as [UsageContextSource, number][])
+		.filter(([, count]) => count > 0)
+		.sort(([a], [b]) => a.localeCompare(b));
+	if (contextEntries.length > 0) {
+		lines.push("");
+		lines.push("context source:");
+		for (const [source, count] of contextEntries) {
+			lines.push(`  ${source}: ${count}`);
+		}
+	}
+
+	lines.push("");
+	lines.push("budget:");
+	lines.push(`  low-risk/GPT-style: ${summary.budget.lowRisk} (warn at ${USAGE_BUDGET.lowRisk})`);
+	lines.push(`  high-risk/Opus-style: ${summary.budget.highRisk} (warn at ${USAGE_BUDGET.highRisk})`);
+	lines.push(`  snapshot: ${summary.budget.snapshot} (warn at ${USAGE_BUDGET.snapshot})`);
+
+	lines.push("");
+	lines.push(`status: ${summary.budgetStatus}`);
+	if (summary.warningsReached.length > 0) {
+		lines.push(`warnings reached: ${summary.warningsReached.join(", ")}`);
+	}
+
+	lines.push("");
+	lines.push("reset with /pitaj usage reset; counters also reset when the Pi session ends.");
+
+	return lines.join("\n");
 }

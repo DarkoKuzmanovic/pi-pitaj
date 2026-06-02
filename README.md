@@ -9,7 +9,7 @@ A tiny [Pi](https://github.com/earendil-works/pi-coding-agent) extension for in-
 - `pitaj` tool: call another configured model from an existing Pi flow.
 - `/pitaj` command: ask a model directly from chat using a compact prompt.
 
-It supports aliases, bounded context + output size, and built-in response modes so you can get a focused consultation without leaving the current session.
+It supports aliases, bounded context + output size, built-in response modes, in-session usage tracking, and advisory budget warnings so you can stay aware of how many consults you have sent.
 
 ## Installation
 
@@ -101,7 +101,36 @@ You can also call the registered tool directly:
 }
 ```
 
-**Note:** Auto-routing via `model: "auto"` is available through the tool schema. Snapshot mode is a slash-command path (`/pitaj snapshot ...`) and does not add a direct tool-schema snapshot parameter. The `/pitaj auto` command syntax is not enabled.
+**Note:** Auto-routing via `model: "auto"` is available through the tool schema and also via the `/pitaj auto` slash command. Snapshot mode is a slash-command path (`/pitaj snapshot ...`) and does not add a direct tool-schema snapshot parameter.
+
+### Auto command
+
+Use `/pitaj auto` to route through the built-in auto-router instead of specifying a model or alias:
+
+```text
+/pitaj auto Is this TypeScript narrowing approach sound?
+/pitaj auto --risk high Is this architecture safe?
+/pitaj auto --risk low --mode debug Check this test assertion
+```
+
+Auto-routing dispatches based on the `--risk` hint (or the `/pitaj` `risk` field): low risk → GPT-style model; high risk → Opus-style model. When risk is omitted and mode is `risk-check`, it routes to Opus; otherwise defaults to GPT.
+
+The `auto` subcommand name is reserved and cannot be used as a settings alias.
+
+### Advise command
+
+Use `/pitaj advise` for a zero-flag advisory shortcut that wraps the curated snapshot builder:
+
+```text
+/pitaj advise Should we keep this implementation boundary?
+/pitaj advise is this safe?
+```
+
+`/pitaj advise` accepts only a bare question. The flags `--mode`, `--brevity`, `-c`, and model-as-first-argument are rejected with a clear error. Use `/pitaj snapshot` if you need those options.
+
+Advise builds context through the same curated snapshot path as `/pitaj snapshot` (recent request, tool-result ring buffer), but is limited to the existing sources — it adds no new capture. Results are labeled advisory. Usage is recorded with `hasSnapshot: true` and counts toward the existing snapshot budget threshold.
+
+The `advise` subcommand name is reserved and cannot be used as a settings alias.
 
 ## Config command
 
@@ -160,6 +189,84 @@ Alias editing is manual in M2: edit `settings.json` directly, then run `/pitaj c
   }
 }
 ```
+
+### Usage summary
+
+`/pitaj usage` shows a compact summary of your current-session consults:
+
+```
+pitaj usage (current session)
+
+total consults: 5
+errors: 0
+
+routes:
+  auto (low-risk): 3
+  explicit (high-risk): 1
+  snapshot: 1
+
+models:
+  gpt (openai/gpt-5.1): 3
+  opus (anthropic/claude-opus-4-8): 2
+
+context source:
+  none: 4
+  snapshot: 1
+
+budget:
+  low-risk/GPT-style: 3 (warn at 3)
+  high-risk/Opus-style: 1 (warn at 3)
+  snapshot: 1 (warn at 5)
+
+status: warning
+warnings reached: low-risk
+
+reset with /pitaj usage reset; counters also reset when the Pi session ends.
+```
+
+Counters reset automatically when your Pi session ends. To reset them manually:
+
+```
+/pitaj usage reset
+```
+
+This clears all in-session consult counters and confirms with `pitaj usage counters reset`.
+
+### Advisory budget warnings
+
+pitaj tracks consults in-session and shows compact advisory guidance when thresholds are reached:
+
+- **Low-risk/GPT-style:** after 3 low-risk consults in the session
+- **High-risk/Opus-style:** after 3 high-risk consults in the session
+- **Snapshot:** after 5 snapshot consults in the session
+
+Warnings are advisory only — no consults are blocked. When a threshold is reached, the result block includes a compact line such as:
+
+```
+warning: You have sent 3 low-risk/GPT-style consults in this session. Run `/pitaj usage` for details or `/pitaj usage reset` to clear counters.
+```
+
+Run `/pitaj usage` to see full details or `/pitaj usage reset` to clear counters.
+
+### Sidecar model limitations
+
+When a second model is consulted, it has no file inspection or tool access unless you explicitly provided that context. Result metadata notes which context was used (none, manual, or snapshot). Do not assume a sidecar model can read your project files unless you included excerpts in your question.
+
+### Result block format
+
+Consult results are presented answer-first, with compact metadata after a divider:
+
+```
+Your answer here.
+
+---
+model: openai/gpt-5.1 (gpt)
+route: mode=answer · brevity=short · auto-routed · reason=auto: default → gpt
+context: none
+sidecar: no tools / no file access (no context provided)
+```
+
+When advisory thresholds are reached, `warning: ...` lines are appended after the metadata.
 
 ## Testing
 

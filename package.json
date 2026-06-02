@@ -5,7 +5,7 @@
   "description": "Ultra-fast in-process model consult extension for Pi",
   "type": "module",
   "scripts": {
-    "test": "node --experimental-strip-types --test helpers.test.ts"
+    "test": "node --experimental-strip-types --test '*.test.ts'"
   },
   "pi": {
     "extensions": ["./index.ts"]

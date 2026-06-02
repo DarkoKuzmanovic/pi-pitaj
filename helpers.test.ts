@@ -5,11 +5,22 @@ import {
 	BREVITY_OUTPUT_CHARS,
 	PITAJ_AUTO_RISKS,
 	CONFIG_EDITABLE_FIELDS,
+	USAGE_BUDGET,
 	buildConsultSystemPrompt,
 	classifySpecialCommand,
+	isAdviseFlagViolation,
 	applyConfigUpdate,
 	formatSettingsChangeSummary,
+	formatResultForDisplay,
 	formatConfigSummaryText,
+	applyUsageWarningFlags,
+	buildInlineWarnings,
+	buildUsageSummary,
+	classifyUsageEvent,
+	createUsageStore,
+	detectContextSource,
+	describeRouteKind,
+	formatUsageSummaryText,
 	mergeSettings,
 	planSettingsWrite,
 	parseCommandArgs,
@@ -22,6 +33,7 @@ import {
 	truncateText,
 } from "./helpers.ts";
 import { buildSnapshotCommandRequest, parseSnapshotCommandArgs } from "./index.ts";
+import { createUsageRecorder } from "./usage.ts";
 import {
 	buildSnapshotContext,
 	SNAPSHOT_CAPTURE_POLICIES,
@@ -35,108 +47,6 @@ import {
 } from "./snapshot-runtime.ts";
 
 const SETTINGS_PATH = "/home/quzma/.pi/agent/extensions/pi-pitaj/settings.json";
-
-describe("pitaj settings and model aliases", () => {
-	it("resolves shorthand aliases case-insensitively", () => {
-		const settings = mergeSettings({ aliases: { opus: "anthropic/claude-opus-4-8" } });
-		assert.deepEqual(resolveModelRef("Opus", settings), {
-			input: "Opus",
-			provider: "anthropic",
-			modelId: "claude-opus-4-8",
-			resolved: "anthropic/claude-opus-4-8",
-			alias: "opus",
-		});
-	});
-
-	it("accepts explicit provider/model references without an alias", () => {
-		const settings = mergeSettings({ aliases: {} });
-		assert.deepEqual(resolveModelRef("mimo/mimo-v2.5-pro", settings), {
-			input: "mimo/mimo-v2.5-pro",
-			provider: "mimo",
-			modelId: "mimo-v2.5-pro",
-			resolved: "mimo/mimo-v2.5-pro",
-		});
-	});
-
-	it("falls back to defaultModel when no model is provided", () => {
-		const settings = mergeSettings({
-			defaultModel: "opus",
-			aliases: { opus: "anthropic/claude-opus-4-8" },
-		});
-		assert.equal(resolveModelRef(undefined, settings).resolved, "anthropic/claude-opus-4-8");
-	});
-
-	it("throws a helpful error for unknown shorthand names", () => {
-		const settings = mergeSettings({ aliases: { opus: "anthropic/claude-opus-4-8" } });
-		assert.throws(() => resolveModelRef("unknown", settings), /Unknown pitaj model "unknown".*opus/s);
-	});
-});
-
-describe("pitaj command parsing", () => {
-	it("parses /pitaj opus question text", () => {
-		const settings = mergeSettings({ aliases: { opus: "anthropic/claude-opus-4-8" } });
-		assert.deepEqual(parseCommandArgs("opus should we do this?", settings), {
-			model: "opus",
-			question: "should we do this?",
-			mode: undefined,
-			brevity: undefined,
-			context: undefined,
-		});
-	});
-
-	it("uses the default model when the first word is not a model", () => {
-		const settings = mergeSettings({ aliases: { opus: "anthropic/claude-opus-4-8" } });
-		assert.deepEqual(parseCommandArgs("should we do this?", settings), {
-			model: undefined,
-			question: "should we do this?",
-			mode: undefined,
-			brevity: undefined,
-			context: undefined,
-		});
-	});
-});
-
-describe("pitaj flag parsing", () => {
-	it("parses --mode and --brevity flags", () => {
-		const settings = mergeSettings({ aliases: { opus: "anthropic/claude-opus-4-8" } });
-		assert.deepEqual(parseCommandArgs("opus --mode risk-check --brevity detailed is this safe?", settings), {
-			model: "opus",
-			question: "is this safe?",
-			mode: "risk-check",
-			brevity: "detailed",
-			context: undefined,
-		});
-	});
-
-	it("parses -c flag for context", () => {
-		const settings = mergeSettings({ aliases: { deepseek: "deepseek/deepseek-v4-pro" } });
-		assert.deepEqual(parseCommandArgs("deepseek -c some-context what edge cases?", settings), {
-			model: "deepseek",
-			question: "what edge cases?",
-			mode: undefined,
-			brevity: undefined,
-			context: "some-context",
-		});
-	});
-
-	it("parses -c flag with quoted multi-word context", () => {
-		const settings = mergeSettings({ aliases: { deepseek: "deepseek/deepseek-v4-pro" } });
-		assert.deepEqual(parseCommandArgs('deepseek -c "Feature: bulk upload" what edge cases?', settings), {
-			model: "deepseek",
-			question: "what edge cases?",
-			mode: undefined,
-			brevity: undefined,
-			context: "Feature: bulk upload",
-		});
-	});
-
-	it("ignores unknown flag values in question", () => {
-		const settings = mergeSettings({ aliases: {} });
-		const result = parseCommandArgs("--mode random stuff here", settings);
-		assert.equal(result.mode, undefined);
-		assert.equal(result.question, "--mode random stuff here");
-	});
-});
 
 describe("pitaj prompt shaping", () => {
 	it("includes mode and brevity in the consult system prompt", () => {
@@ -175,6 +85,69 @@ describe("pitaj command routing", () => {
 		assert.equal(classifySpecialCommand("help me"), "none");
 		assert.equal(classifySpecialCommand("opus help"), "none");
 		assert.equal(classifySpecialCommand("snapshot this"), "none");
+	});
+
+	it("classifies advise as a special command", () => {
+		assert.equal(classifySpecialCommand("advise"), "advise");
+		assert.equal(classifySpecialCommand("ADVISE"), "advise");
+	});
+
+	it("treats 'advise is this safe?' as a prefix-matching advise command", () => {
+		assert.equal(classifySpecialCommand("advise is this safe?"), "advise");
+		assert.equal(classifySpecialCommand("advise should we ship?"), "advise");
+	});
+
+	it("does not treat non-advise input as the advise command", () => {
+		assert.equal(classifySpecialCommand("adviser"), "none");
+		assert.equal(classifySpecialCommand("opus advise"), "none");
+	});
+
+	it("does not modify existing special commands alongside advise", () => {
+		assert.equal(classifySpecialCommand("help"), "help");
+		assert.equal(classifySpecialCommand("auto"), "auto");
+		assert.equal(classifySpecialCommand("snapshot"), "snapshot");
+		assert.equal(classifySpecialCommand("config"), "config");
+		assert.equal(classifySpecialCommand("usage"), "usage");
+		assert.equal(classifySpecialCommand("advise"), "advise");
+	});
+});
+
+describe("pitaj advise flag violation", () => {
+	const settings = mergeSettings({}, {
+		defaultModel: "gpt",
+		defaultMode: "answer",
+		defaultBrevity: "normal",
+		aliases: { opus: "anthropic/claude-opus-4-7", deepseek: "deepseek/deepseek-v4-pro" },
+	});
+
+	it("flags forbidden flags in advise input", () => {
+		const { forbiddenFlags, looksLikeModel } = isAdviseFlagViolation("--mode plan should we refactor?", settings);
+		assert.ok(forbiddenFlags.length > 0);
+		assert.equal(looksLikeModel, false);
+	});
+
+	it("flags model-as-first-token with slash", () => {
+		const { forbiddenFlags, looksLikeModel } = isAdviseFlagViolation("anthropic/claude-opus should we refactor?", settings);
+		assert.equal(forbiddenFlags.length, 0);
+		assert.equal(looksLikeModel, true);
+	});
+
+	it("flags model-as-first-token with alias", () => {
+		const { forbiddenFlags, looksLikeModel } = isAdviseFlagViolation("opus should we refactor?", settings);
+		assert.equal(forbiddenFlags.length, 0);
+		assert.equal(looksLikeModel, true);
+	});
+
+	it("allows bare questions without flags or model", () => {
+		const { forbiddenFlags, looksLikeModel } = isAdviseFlagViolation("should we refactor the auth layer?", settings);
+		assert.equal(forbiddenFlags.length, 0);
+		assert.equal(looksLikeModel, false);
+	});
+
+	it("allows questions with slashes inside words", () => {
+		const { forbiddenFlags, looksLikeModel } = isAdviseFlagViolation("is client/server split ok?", settings);
+		assert.equal(forbiddenFlags.length, 0);
+		assert.equal(looksLikeModel, false);
 	});
 });
 
@@ -518,87 +491,6 @@ describe("brevity output scaling", () => {
 	});
 });
 
-describe("pitaj auto routing", () => {
-	it("routes high risk to opus with risk-check suggestion when mode omitted", () => {
-		const settings = mergeSettings();
-		const result = resolveAutoRoute({ risk: "high" }, settings);
-		assert.equal(result.alias, "opus");
-		assert.equal(result.routingReason, "auto: risk=high → opus");
-		assert.equal(result.suggestedMode, "risk-check");
-	});
-
-	it("routes high risk to opus without suggestion when mode is explicit", () => {
-		const settings = mergeSettings();
-		const result = resolveAutoRoute({ risk: "high", mode: "debug" }, settings);
-		assert.equal(result.alias, "opus");
-		assert.equal(result.routingReason, "auto: risk=high → opus");
-		assert.equal(result.suggestedMode, undefined);
-	});
-
-	it("routes low risk to gpt without suggestion", () => {
-		const settings = mergeSettings();
-		const result = resolveAutoRoute({ risk: "low" }, settings);
-		assert.equal(result.alias, "gpt");
-		assert.equal(result.routingReason, "auto: risk=low → gpt");
-		assert.equal(result.suggestedMode, undefined);
-	});
-
-	it("routes no risk + risk-check mode to opus", () => {
-		const settings = mergeSettings();
-		const result = resolveAutoRoute({ mode: "risk-check" }, settings);
-		assert.equal(result.alias, "opus");
-		assert.equal(result.routingReason, "auto: mode=risk-check → opus");
-		assert.equal(result.suggestedMode, undefined);
-	});
-
-	it("routes no risk + debug mode to gpt", () => {
-		const settings = mergeSettings();
-		const result = resolveAutoRoute({ mode: "debug" }, settings);
-		assert.equal(result.alias, "gpt");
-		assert.equal(result.routingReason, "auto: default → gpt");
-		assert.equal(result.suggestedMode, undefined);
-	});
-
-	it("routes no risk + omitted mode to gpt", () => {
-		const settings = mergeSettings();
-		const result = resolveAutoRoute({}, settings);
-		assert.equal(result.alias, "gpt");
-		assert.equal(result.routingReason, "auto: default → gpt");
-		assert.equal(result.suggestedMode, undefined);
-	});
-
-	it("throws when selected gpt alias is blank", () => {
-		const settings = mergeSettings({ aliases: { gpt: "", opus: "anthropic/claude-opus-4-8" } });
-		assert.throws(
-			() => resolveAutoRoute({ risk: "low" }, settings),
-			/pitaj auto routing requires a non-empty "gpt" alias/,
-		);
-	});
-
-	it("throws when selected opus alias is blank", () => {
-		const settings = mergeSettings({ aliases: { opus: "", gpt: "openai-codex/gpt-5.5" } });
-		assert.throws(
-			() => resolveAutoRoute({ risk: "high" }, settings),
-			/pitaj auto routing requires a non-empty "opus" alias/,
-		);
-	});
-
-	it("rejects invalid runtime risk hints", () => {
-		const settings = mergeSettings();
-		assert.throws(
-			() => resolveAutoRoute({ risk: "medium" as never }, settings),
-			/Unknown pitaj auto risk "medium"/,
-		);
-	});
-
-	it("keeps manual model resolution separate from auto routing hints", () => {
-		const settings = mergeSettings();
-		assert.deepEqual([...PITAJ_AUTO_RISKS], ["low", "high"]);
-		assert.equal(resolveModelRef("gpt", settings).alias, "gpt");
-		assert.equal(resolveModelRef("mimo/mimo-v2.5-pro", settings).resolved, "mimo/mimo-v2.5-pro");
-	});
-});
-
 describe("pitaj tool wiring contract", () => {
 	const indexSource = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
 
@@ -646,209 +538,6 @@ describe("pitaj tool wiring contract", () => {
 	});
 });
 
-describe("pitaj M2 config contract", () => {
-	it("leaves absent numeric fields as undefined in settingsFromUnknown", () => {
-		const parsed = settingsFromUnknown({ defaultModel: "opus" });
-		assert.equal(parsed.maxContextChars, undefined);
-		assert.equal(parsed.maxOutputChars, undefined);
-	});
-
-	it("drops invalid numeric and string fields in settingsFromUnknown", () => {
-		const parsed = settingsFromUnknown({
-			defaultModel: 42,
-			defaultMode: "wrong",
-			defaultBrevity: "wrong",
-			maxContextChars: "x",
-			maxOutputChars: -1,
-			aliases: { "": "target", OK: "  ", good: "anthropic/claude-opus-4-8" },
-		});
-		assert.equal(parsed.defaultModel, undefined);
-		assert.equal(parsed.defaultMode, undefined);
-		assert.equal(parsed.defaultBrevity, undefined);
-		assert.equal(parsed.maxContextChars, undefined);
-		assert.equal(parsed.maxOutputChars, undefined);
-		assert.deepEqual(parsed.aliases, { good: "anthropic/claude-opus-4-8" });
-	});
-
-	it("parses new autoRouteLow and autoRouteHigh fields and ignores invalid values", () => {
-		const parsed = settingsFromUnknown({ autoRouteLow: "gpt", autoRouteHigh: "opus47" });
-		assert.equal(parsed.autoRouteLow, "gpt");
-		assert.equal(parsed.autoRouteHigh, "opus47");
-		const invalid = settingsFromUnknown({ autoRouteLow: 42, autoRouteHigh: "" });
-		assert.equal(invalid.autoRouteLow, undefined);
-		assert.equal(invalid.autoRouteHigh, undefined);
-	});
-
-	it("propagates undefined numerics through mergeSettings so brevity defaults still apply", () => {
-		const settings = mergeSettings({ defaultModel: "opus" });
-		assert.equal(settings.maxContextChars, undefined);
-		assert.equal(settings.maxOutputChars, undefined);
-		assert.equal(settings.autoRouteLow, undefined);
-		assert.equal(settings.autoRouteHigh, undefined);
-		assert.equal(settings.defaultModel, "opus");
-		assert.equal(settings.aliases.gpt, "openai-codex/gpt-5.5");
-	});
-
-	it("does not require resolveAutoRoute alias to be a literal 'gpt' or 'opus'", () => {
-		const settings = mergeSettings({
-			autoRouteLow: "spark",
-			autoRouteHigh: "opus47",
-			aliases: { spark: "openai-codex/codex-5.3-spark", opus47: "anthropic/claude-opus-4-7" },
-		});
-		assert.equal(resolveAutoRoute({ risk: "low" }, settings).alias, "spark");
-		assert.equal(resolveAutoRoute({ risk: "high" }, settings).alias, "opus47");
-	});
-
-	it("falls back to default 'gpt' and 'opus' auto-route aliases when settings don't override", () => {
-		const settings = mergeSettings({
-			aliases: { gpt: "openai-codex/gpt-5.5", opus: "anthropic/claude-opus-4-8" },
-		});
-		assert.equal(resolveAutoRoute({ risk: "low" }, settings).alias, "gpt");
-		assert.equal(resolveAutoRoute({ risk: "high" }, settings).alias, "opus");
-	});
-
-	it("throws when configured autoRouteLow points to a missing or blank alias", () => {
-		const settings = mergeSettings({ autoRouteLow: "missingAlias", aliases: { opus: "anthropic/claude-opus-4-8" } });
-		assert.throws(
-			() => resolveAutoRoute({ risk: "low" }, settings),
-			/pitaj auto routing requires a non-empty "missingalias" alias/,
-		);
-	});
-
-	it("resolves maxOutputChars with request then settings then brevity precedence", () => {
-		const settings = mergeSettings({ maxOutputChars: 2222 });
-		assert.equal(resolveMaxOutputChars(1111, settings, "short"), 1111);
-		assert.equal(resolveMaxOutputChars(undefined, settings, "short"), 2222);
-		assert.equal(resolveMaxOutputChars(undefined, mergeSettings(), "short"), BREVITY_OUTPUT_CHARS.short);
-	});
-});
-
-describe("pitaj M2 config summary and validation helpers", () => {
-	it("summarizes effective settings including auto-route aliases and file state", () => {
-		const settings = mergeSettings({
-			autoRouteLow: "gpt",
-			autoRouteHigh: "opus",
-			aliases: { gpt: "openai-codex/gpt-5.5", opus: "anthropic/claude-opus-4-8" },
-		});
-		const summary = summarizeSettings(settings, "loaded");
-		assert.equal(summary.fileState, "loaded");
-		assert.equal(summary.effective.defaultModel, "opus");
-		assert.equal(summary.effective.defaultMode, "answer");
-		assert.equal(summary.effective.defaultBrevity, "short");
-		assert.equal(summary.effective.maxContextChars, undefined);
-		assert.equal(summary.effective.maxOutputChars, undefined);
-		assert.equal(summary.effective.autoRouteLow, "gpt");
-		assert.equal(summary.effective.autoRouteHigh, "opus");
-		assert.equal(summary.aliasCount, 8);
-	});
-
-	it("marks summary with a not-found file state when settings are defaults only", () => {
-		const settings = mergeSettings();
-		const summary = summarizeSettings(settings, "not-found");
-		assert.equal(summary.fileState, "not-found");
-		assert.equal(summary.effective.maxContextChars, undefined);
-	});
-
-	it("flags malformed file state without overwriting effective settings", () => {
-		const settings = mergeSettings({ defaultModel: "opus" });
-		const summary = summarizeSettings(settings, "malformed");
-		assert.equal(summary.fileState, "malformed");
-		assert.equal(summary.manualRecoveryPath, true);
-		assert.match(summary.manualEditHint, /settings\.json/);
-	});
-
-	it("formats the summary as a multi-line text with manual edit path", () => {
-		const settings = mergeSettings({
-			aliases: { gpt: "openai-codex/gpt-5.5", opus: "anthropic/claude-opus-4-8" },
-		});
-		const text = formatConfigSummaryText(summarizeSettings(settings, "loaded"), SETTINGS_PATH);
-		assert.match(text, /defaultModel: opus/);
-		assert.match(text, /autoRouteLow: gpt/);
-		assert.match(text, /autoRouteHigh: opus/);
-		assert.match(text, /aliases: 8/);
-		assert.match(text, /settings\.json/);
-	});
-
-	it("serializes settings as formatted manual-editable JSON", () => {
-		const text = serializeSettings(
-			mergeSettings({
-				defaultModel: "mimo",
-				maxOutputChars: 1234,
-				autoRouteLow: "spark",
-			}),
-		);
-		const parsed = JSON.parse(text) as Record<string, unknown>;
-		assert.equal(parsed.defaultModel, "mimo");
-		assert.equal(parsed.maxOutputChars, 1234);
-		assert.equal(parsed.autoRouteLow, "spark");
-		assert.match(text, /\n  "aliases": \{/);
-	});
-
-	it("plans settings writes without silently overwriting malformed files", () => {
-		const settings = mergeSettings();
-		assert.equal(planSettingsWrite(settings, "not-found").canWrite, true);
-		assert.equal(planSettingsWrite(settings, "loaded").canWrite, true);
-		const malformed = planSettingsWrite(settings, "malformed");
-		assert.equal(malformed.canWrite, false);
-		assert.match(malformed.reason, /malformed/);
-	});
-});
-
-	describe("interactive config update helpers", () => {
-		it("applies validated common setting updates without dropping aliases", () => {
-			const settings = mergeSettings({ aliases: { custom: "provider/model" } });
-			const updated = applyConfigUpdate(settings, "defaultModel", "custom");
-			assert.equal(updated.defaultModel, "custom");
-			assert.equal(updated.aliases.custom, "provider/model");
-			assert.throws(() => applyConfigUpdate(settings, "defaultModel", ""), /non-empty alias or provider\/model/);
-			assert.deepEqual(CONFIG_EDITABLE_FIELDS, [
-				"defaultModel",
-				"autoRouteLow",
-				"autoRouteHigh",
-				"defaultMode",
-				"defaultBrevity",
-				"maxContextChars",
-				"maxOutputChars",
-			]);
-		});
-
-		it("requires auto-route targets to name existing aliases", () => {
-			const settings = mergeSettings({ aliases: { spark: "openai-codex/codex-5.3-spark" } });
-			assert.equal(applyConfigUpdate(settings, "autoRouteLow", "spark").autoRouteLow, "spark");
-			assert.throws(() => applyConfigUpdate(settings, "autoRouteHigh", "missing"), /existing alias/);
-		});
-
-		it("validates enum and numeric config updates and allows clearing numeric overrides", () => {
-			const settings = mergeSettings({ maxContextChars: 12000, maxOutputChars: 4000 });
-			assert.equal(applyConfigUpdate(settings, "defaultMode", "risk-check").defaultMode, "risk-check");
-			assert.equal(applyConfigUpdate(settings, "defaultBrevity", "detailed").defaultBrevity, "detailed");
-			assert.equal(applyConfigUpdate(settings, "maxContextChars", "1234").maxContextChars, 1234);
-			assert.equal(applyConfigUpdate(settings, "maxOutputChars", "").maxOutputChars, undefined);
-			assert.throws(() => applyConfigUpdate(settings, "maxOutputChars", "0"), /positive integer/);
-		});
-
-		it("formats a concise changed-fields summary for confirmation", () => {
-			const before = mergeSettings({ defaultModel: "opus", maxOutputChars: 4000 });
-			const after = applyConfigUpdate(before, "maxOutputChars", "2000");
-			const summary = formatSettingsChangeSummary(before, after);
-			assert.match(summary, /maxOutputChars: 4000 -> 2000/);
-			assert.doesNotMatch(summary, /defaultModel/);
-		});
-
-		it("wires the interactive config path through UI selection, confirmation, and serialized writes", () => {
-			const indexSource = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-			assert.match(indexSource, /ctx\.hasUI/);
-			assert.match(indexSource, /ctx\.ui\.select\("pitaj config"/);
-			assert.match(indexSource, /ctx\.ui\.input\(`Enter \$\{field\}`/);
-			assert.match(indexSource, /ctx\.ui\.confirm\(\s*"Write pitaj settings\?"/);
-			assert.match(indexSource, /writeFileSync\(SETTINGS_PATH, serializeSettings\(updated\), "utf8"\)/);
-			assert.match(indexSource, /try \{\s*writeFileSync\(SETTINGS_PATH, serializeSettings\(updated\), "utf8"\);/s);
-			assert.match(indexSource, /pitaj config save failed/);
-			assert.match(indexSource, /loaded\.fileState === "malformed"/);
-			assert.match(indexSource, /Alias editing is manual in M2/);
-		});
-	});
-
 describe("pitaj /pitaj config command classification", () => {
 	it("classifies config as a special command", () => {
 		assert.equal(classifySpecialCommand("config"), "config");
@@ -876,5 +565,688 @@ describe("pitaj /pitaj config command classification", () => {
 		assert.equal(classifySpecialCommand("aliases"), "aliases");
 		assert.equal(classifySpecialCommand("snapshot"), "snapshot");
 		assert.equal(classifySpecialCommand("snapshot this"), "none");
+	});
+});
+
+
+describe("pitaj M3 result block foundation", () => {
+	it("keeps the answer as the first line and metadata after a divider", () => {
+		const rendered = formatResultForDisplay("Confirmed answer.", {
+			model: "openai/gpt-5.1",
+			alias: "gpt",
+			mode: "answer",
+			brevity: "short",
+			contextChars: 0,
+		});
+
+		const lines = rendered.split("\n");
+		assert.equal(lines[0], "Confirmed answer.");
+		assert.ok(lines.includes("---"));
+		assert.ok(lines.indexOf("model: openai/gpt-5.1 (gpt)") > lines.indexOf("---"));
+		assert.ok(lines.includes("context: none"));
+		assert.ok(lines.includes("sidecar: no tools / no file access (no context provided)"));
+	});
+
+	it("renders auto-route and manual context metadata", () => {
+		const rendered = formatResultForDisplay("Use the narrower fix.", {
+			model: "anthropic/claude-opus-4-8",
+			alias: "opus",
+			mode: "risk-check",
+			brevity: "normal",
+			contextChars: 1234,
+			autoRouted: true,
+			routingReason: "risk=high",
+		});
+
+		assert.match(rendered, /^Use the narrower fix\./);
+		assert.match(rendered, /model: anthropic\/claude-opus-4-8 \(opus\)/);
+		assert.match(rendered, /route: mode=risk-check · brevity=normal · auto-routed · reason=risk=high/);
+		assert.match(rendered, /context: manual, 1234 chars/);
+		assert.match(rendered, /sidecar: no tools \/ no file access \(caller-provided context only\)/);
+	});
+
+	it("renders snapshot categories and explicit snapshot context", () => {
+		const rendered = formatResultForDisplay("Snapshot answer.", {
+			model: "openai/gpt-5.1",
+			mode: "answer",
+			brevity: "short",
+			contextChars: 4321,
+			snapshot: {
+				includedCategories: ["selection", "git"],
+				truncatedCategories: ["toolResults"],
+				omittedCategories: ["activePlan"],
+				truncated: true,
+			},
+		});
+
+		assert.match(rendered, /^Snapshot answer\./);
+		assert.match(rendered, /context: snapshot/);
+		assert.match(rendered, /snapshot: included=2, truncated=1, omitted=1, size=truncated \(\+selection, \+git, ~toolResults, -activePlan\)/);
+		assert.match(rendered, /sidecar: no tools \/ no file access \(snapshot context only\)/);
+	});
+
+	it("renders optional post-answer warnings without moving the answer", () => {
+		const rendered = formatResultForDisplay(
+			"Budget answer.",
+			{ model: "openai/gpt-5.1", mode: "answer", brevity: "short", contextChars: 0 },
+			{ warnings: ["low-risk consult threshold reached"] },
+		);
+
+		const lines = rendered.split("\n");
+		assert.equal(lines[0], "Budget answer.");
+		assert.ok(lines.includes("warning: low-risk consult threshold reached"));
+	});
+
+	it("renders advisory label when isAdvisory is true", () => {
+		const rendered = formatResultForDisplay(
+			"Advisory answer.",
+			{
+				model: "openai/gpt-5.1",
+				mode: "answer",
+				brevity: "short",
+				contextChars: 200,
+				snapshot: {
+					includedCategories: ["selection"],
+					truncatedCategories: [],
+					omittedCategories: ["activePlan", "toolResults"],
+					truncated: false,
+				},
+			},
+			{ isAdvisory: true },
+		);
+
+		assert.match(rendered, /^Advisory answer\./);
+		assert.match(rendered, /advisory: true — advisory snapshot consult/);
+		assert.match(rendered, /context: snapshot/);
+	});
+});
+
+
+describe("pitaj M3-B2 usage accounting", () => {
+	it("classifies usage and usage reset as the usage special command", () => {
+		assert.equal(classifySpecialCommand("usage"), "usage");
+		assert.equal(classifySpecialCommand("USAGE"), "usage");
+		assert.equal(classifySpecialCommand("usage reset"), "usage");
+		assert.equal(classifySpecialCommand("USAGE RESET"), "usage");
+	});
+
+	it("does not treat non-usage input as the usage command", () => {
+		assert.equal(classifySpecialCommand("usage stats for last week"), "none");
+		assert.equal(classifySpecialCommand("how is usage tracked?"), "none");
+		assert.equal(classifySpecialCommand("opus usage"), "none");
+	});
+
+	it("does not regress other special commands", () => {
+		assert.equal(classifySpecialCommand("help"), "help");
+		assert.equal(classifySpecialCommand("check"), "check");
+		assert.equal(classifySpecialCommand("aliases"), "aliases");
+		assert.equal(classifySpecialCommand("snapshot"), "snapshot");
+		assert.equal(classifySpecialCommand("snapshot this"), "none");
+		assert.equal(classifySpecialCommand("config"), "config");
+	});
+
+	it("classifies context source as none/manual/snapshot", () => {
+		assert.equal(detectContextSource({ hasSnapshot: false, contextChars: 0 }), "none");
+		assert.equal(detectContextSource({ hasSnapshot: false, contextChars: 1200 }), "manual");
+		assert.equal(detectContextSource({ hasSnapshot: true, contextChars: 0 }), "snapshot");
+		assert.equal(detectContextSource({ hasSnapshot: true, contextChars: 1200 }), "snapshot");
+	});
+
+	it("classifies low-risk auto route events", () => {
+		const c = classifyUsageEvent({
+			requestedModel: "auto",
+			resolvedModel: "openai/gpt-5.1",
+			resolvedAlias: "gpt",
+			autoRouted: true,
+			risk: "low",
+			mode: "answer",
+			success: true,
+			contextSource: "none",
+		});
+		assert.equal(c.routeKind, "auto-low");
+		assert.equal(c.risk, "low");
+	});
+
+	it("classifies default auto route events as low-risk", () => {
+		const c = classifyUsageEvent({
+			requestedModel: "auto",
+			resolvedModel: "openai/gpt-5.1",
+			resolvedAlias: "gpt",
+			autoRouted: true,
+			mode: "answer",
+			success: true,
+			contextSource: "none",
+		});
+		assert.equal(c.routeKind, "auto-low");
+		assert.equal(c.risk, "low");
+	});
+
+	it("classifies high-risk auto route events", () => {
+		const c = classifyUsageEvent({
+			requestedModel: "auto",
+			resolvedModel: "openai/gpt-5.1",
+			resolvedAlias: "gpt",
+			autoRouted: true,
+			risk: "high",
+			mode: "answer",
+			success: true,
+			contextSource: "none",
+		});
+		assert.equal(c.routeKind, "auto-high");
+		assert.equal(c.risk, "high");
+	});
+
+	it("classifies auto risk-check events", () => {
+		const c = classifyUsageEvent({
+			requestedModel: "auto",
+			resolvedModel: "anthropic/claude-opus-4-8",
+			resolvedAlias: "opus",
+			autoRouted: true,
+			risk: "high",
+			mode: "risk-check",
+			success: true,
+			contextSource: "none",
+		});
+		assert.equal(c.routeKind, "auto-risk-check");
+		assert.equal(c.risk, "high");
+	});
+
+	it("classifies explicit model events with manual context", () => {
+		const c = classifyUsageEvent({
+			requestedModel: "opus",
+			resolvedModel: "anthropic/claude-opus-4-8",
+			resolvedAlias: "opus",
+			autoRouted: false,
+			risk: "high",
+			mode: "answer",
+			success: true,
+			contextSource: "manual",
+		});
+		assert.equal(c.routeKind, "explicit-high");
+		assert.equal(c.risk, "high");
+	});
+
+	it("classifies explicit GPT-style and Opus-style events without risk hints", () => {
+		const low = classifyUsageEvent({
+			requestedModel: "gpt",
+			resolvedModel: "openai/gpt-5.1",
+			resolvedAlias: "gpt",
+			autoRouted: false,
+			mode: "answer",
+			success: true,
+			contextSource: "none",
+		});
+		assert.equal(low.routeKind, "explicit-low");
+		assert.equal(low.risk, "low");
+
+		const high = classifyUsageEvent({
+			requestedModel: "opus",
+			resolvedModel: "anthropic/claude-opus-4-8",
+			resolvedAlias: "opus",
+			autoRouted: false,
+			mode: "answer",
+			success: true,
+			contextSource: "none",
+		});
+		assert.equal(high.routeKind, "explicit-high");
+		assert.equal(high.risk, "high");
+	});
+
+	it("classifies snapshot events regardless of auto flag", () => {
+		const c = classifyUsageEvent({
+			requestedModel: "auto",
+			resolvedModel: "openai/gpt-5.1",
+			resolvedAlias: "gpt",
+			autoRouted: false,
+			success: true,
+			contextSource: "snapshot",
+		});
+		assert.equal(c.routeKind, "snapshot");
+		assert.equal(c.risk, "none");
+	});
+
+	it("classifies handled errors as error events", () => {
+		const c = classifyUsageEvent({
+			requestedModel: "opus",
+			resolvedModel: "unknown",
+			autoRouted: false,
+			success: false,
+			contextSource: "none",
+		});
+		assert.equal(c.routeKind, "error");
+		assert.equal(c.risk, "none");
+	});
+
+	it("records events without storing the prompt or context", () => {
+		const store = createUsageStore();
+		store.record({
+			timestamp: 1,
+			requestedModel: "opus",
+			resolvedModel: "anthropic/claude-opus-4-8",
+			resolvedAlias: "opus",
+			autoRouted: false,
+			routeKind: "explicit-high",
+			mode: "answer",
+			brevity: "short",
+			risk: "high",
+			contextSource: "manual",
+			contextChars: 42,
+			maxOutputChars: 2000,
+			success: true,
+			truncated: false,
+		});
+		const snap = store.snapshot();
+		assert.equal(snap.events.length, 1);
+		const json = JSON.stringify(snap.events);
+		assert.equal(json.includes("question"), false);
+		assert.equal(json.includes("prompt"), false);
+		assert.equal(json.includes("contextChars"), true);
+		assert.equal(json.includes("caller-provided"), false);
+	});
+
+	it("does not retain provider error messages in usage events", () => {
+		const recorder = createUsageRecorder();
+		recorder.recordFromRequest({
+			requestedModel: "opus",
+			resolvedModel: "anthropic/claude-opus-4-8",
+			resolvedAlias: "opus",
+			autoRouted: false,
+			mode: "answer",
+			brevity: "short",
+			contextChars: 0,
+			hasSnapshot: false,
+			maxOutputChars: 2000,
+			success: false,
+		});
+		const text = recorder.renderSummary();
+		assert.equal(text.includes("provider echoed secret"), false);
+		assert.equal(text.includes("caller-provided"), false);
+	});
+
+	it("records failed snapshot consults as snapshot context", () => {
+		const recorder = createUsageRecorder();
+		recorder.recordFromRequest({
+			requestedModel: "auto",
+			resolvedModel: "openai/gpt-5.1",
+			resolvedAlias: "gpt",
+			autoRouted: true,
+			mode: "answer",
+			brevity: "short",
+			contextChars: 1200,
+			hasSnapshot: true,
+			maxOutputChars: 2000,
+			success: false,
+			truncated: true,
+		});
+		const text = recorder.renderSummary();
+		assert.match(text, /errors: 1/);
+		assert.match(text, /context source:\n  snapshot: 1/);
+	});
+
+	it("flags low-risk warning at threshold 3", () => {
+		const store = createUsageStore();
+		for (let i = 0; i < USAGE_BUDGET.lowRisk - 1; i += 1) {
+			store.record({
+				timestamp: i,
+				requestedModel: "auto",
+				resolvedModel: "openai/gpt-5.1",
+				autoRouted: true,
+				routeKind: "auto-low",
+				mode: "answer",
+				brevity: "short",
+				risk: "low",
+				contextSource: "none",
+				contextChars: 0,
+				maxOutputChars: 0,
+				success: true,
+				truncated: false,
+			});
+		}
+		assert.equal(store.snapshot().totals.lowRiskWarned, false);
+		store.record({
+			timestamp: 99,
+			requestedModel: "auto",
+			resolvedModel: "openai/gpt-5.1",
+			autoRouted: true,
+			routeKind: "auto-low",
+			mode: "answer",
+			brevity: "short",
+			risk: "low",
+			contextSource: "none",
+			contextChars: 0,
+			maxOutputChars: 0,
+			success: true,
+			truncated: false,
+		});
+		assert.equal(store.snapshot().totals.lowRiskWarned, true);
+		assert.equal(store.snapshot().totals.lowRisk, USAGE_BUDGET.lowRisk);
+	});
+
+	it("flags high-risk warning at threshold 3", () => {
+		const store = createUsageStore();
+		for (let i = 0; i < USAGE_BUDGET.highRisk; i += 1) {
+			store.record({
+				timestamp: i,
+				requestedModel: "auto",
+				resolvedModel: "openai/gpt-5.1",
+				autoRouted: true,
+				routeKind: "auto-high",
+				mode: "answer",
+				brevity: "short",
+				risk: "high",
+				contextSource: "none",
+				contextChars: 0,
+				maxOutputChars: 0,
+				success: true,
+				truncated: false,
+			});
+		}
+		const totals = store.snapshot().totals;
+		assert.equal(totals.highRiskWarned, true);
+		assert.equal(totals.highRisk, USAGE_BUDGET.highRisk);
+	});
+
+	it("flags snapshot warning at threshold >= 5", () => {
+		const store = createUsageStore();
+		for (let i = 0; i < USAGE_BUDGET.snapshot - 1; i += 1) {
+			store.record({
+				timestamp: i,
+				requestedModel: "auto",
+				resolvedModel: "openai/gpt-5.1",
+				autoRouted: false,
+				routeKind: "snapshot",
+				mode: "answer",
+				brevity: "short",
+				risk: "none",
+				contextSource: "snapshot",
+				contextChars: 0,
+				maxOutputChars: 0,
+				success: true,
+				truncated: false,
+			});
+		}
+		assert.equal(store.snapshot().totals.snapshotWarned, false);
+		store.record({
+			timestamp: 99,
+			requestedModel: "auto",
+			resolvedModel: "openai/gpt-5.1",
+			autoRouted: false,
+			routeKind: "snapshot",
+			mode: "answer",
+			brevity: "short",
+			risk: "none",
+			contextSource: "snapshot",
+			contextChars: 0,
+			maxOutputChars: 0,
+			success: true,
+			truncated: false,
+		});
+		const totals = store.snapshot().totals;
+		assert.equal(totals.snapshotWarned, true);
+		assert.equal(totals.snapshot, USAGE_BUDGET.snapshot);
+	});
+
+	it("does not treat error events as budget consultations", () => {
+		const store = createUsageStore();
+		for (let i = 0; i < 5; i += 1) {
+			store.record({
+				timestamp: i,
+				requestedModel: "opus",
+				resolvedModel: "unknown",
+				autoRouted: false,
+				routeKind: "error",
+				mode: "answer",
+				brevity: "short",
+				risk: "none",
+				contextSource: "none",
+				contextChars: 0,
+				maxOutputChars: 0,
+				success: false,
+				truncated: false,
+			});
+		}
+		const totals = store.snapshot().totals;
+		assert.equal(totals.lowRisk, 0);
+		assert.equal(totals.highRisk, 0);
+		assert.equal(totals.snapshot, 0);
+		assert.equal(totals.lowRiskWarned, false);
+	});
+
+	it("resets all counters and warning flags", () => {
+		const store = createUsageStore();
+		store.record({
+			timestamp: 0,
+			requestedModel: "auto",
+			resolvedModel: "openai/gpt-5.1",
+			autoRouted: true,
+			routeKind: "auto-low",
+			mode: "answer",
+			brevity: "short",
+			risk: "low",
+			contextSource: "none",
+			contextChars: 0,
+			maxOutputChars: 0,
+			success: true,
+			truncated: false,
+		});
+		store.record({
+			timestamp: 1,
+			requestedModel: "auto",
+			resolvedModel: "openai/gpt-5.1",
+			autoRouted: true,
+			routeKind: "auto-low",
+			mode: "answer",
+			brevity: "short",
+			risk: "low",
+			contextSource: "none",
+			contextChars: 0,
+			maxOutputChars: 0,
+			success: true,
+			truncated: false,
+		});
+		store.record({
+			timestamp: 2,
+			requestedModel: "auto",
+			resolvedModel: "openai/gpt-5.1",
+			autoRouted: true,
+			routeKind: "auto-low",
+			mode: "answer",
+			brevity: "short",
+			risk: "low",
+			contextSource: "none",
+			contextChars: 0,
+			maxOutputChars: 0,
+			success: true,
+			truncated: false,
+		});
+		assert.equal(store.snapshot().totals.lowRiskWarned, true);
+		store.reset();
+		const snap = store.snapshot();
+		assert.equal(snap.events.length, 0);
+		assert.equal(snap.totals.lowRisk, 0);
+		assert.equal(snap.totals.highRisk, 0);
+		assert.equal(snap.totals.snapshot, 0);
+		assert.equal(snap.totals.lowRiskWarned, false);
+		assert.equal(snap.totals.highRiskWarned, false);
+		assert.equal(snap.totals.snapshotWarned, false);
+	});
+
+	it("builds a summary that includes total, routes, context, budget, and reset guidance", () => {
+		const store = createUsageStore();
+		store.record({
+			timestamp: 0,
+			requestedModel: "auto",
+			resolvedModel: "openai/gpt-5.1",
+			resolvedAlias: "gpt",
+			autoRouted: true,
+			routeKind: "auto-low",
+			mode: "answer",
+			brevity: "short",
+			risk: "low",
+			contextSource: "none",
+			contextChars: 0,
+			maxOutputChars: 0,
+			success: true,
+			truncated: false,
+		});
+		store.record({
+			timestamp: 1,
+			requestedModel: "auto",
+			resolvedModel: "openai/gpt-5.1",
+			resolvedAlias: "gpt",
+			autoRouted: true,
+			routeKind: "auto-high",
+			mode: "risk-check",
+			brevity: "normal",
+			risk: "high",
+			contextSource: "manual",
+			contextChars: 500,
+			maxOutputChars: 0,
+			success: true,
+			truncated: false,
+		});
+		store.record({
+			timestamp: 2,
+			requestedModel: "auto",
+			resolvedModel: "openai/gpt-5.1",
+			resolvedAlias: "gpt",
+			autoRouted: false,
+			routeKind: "snapshot",
+			mode: "answer",
+			brevity: "short",
+			risk: "none",
+			contextSource: "snapshot",
+			contextChars: 4000,
+			maxOutputChars: 0,
+			success: true,
+			truncated: false,
+		});
+		const summary = buildUsageSummary(store.snapshot());
+		assert.equal(summary.total, 3);
+		assert.equal(summary.byRouteKind["auto-low"], 1);
+		assert.equal(summary.byRouteKind["auto-high"], 1);
+		assert.equal(summary.byRouteKind.snapshot, 1);
+		assert.equal(summary.byContext.none, 1);
+		assert.equal(summary.byContext.manual, 1);
+		assert.equal(summary.byContext.snapshot, 1);
+		assert.equal(summary.errors, 0);
+		assert.equal(summary.byModel["gpt (openai/gpt-5.1)"], 3);
+		assert.equal(summary.budgetStatus, "ok");
+
+		const text = formatUsageSummaryText(summary);
+		assert.match(text, /pitaj usage \(current session\)/);
+		assert.match(text, /total consults: 3/);
+		assert.match(text, /routes:/);
+		assert.match(text, /auto \(low-risk\): 1/);
+		assert.match(text, /auto \(high-risk\): 1/);
+		assert.match(text, /snapshot: 1/);
+		assert.match(text, /models:/);
+		assert.match(text, /gpt \(openai\/gpt-5\.1\): 3/);
+		assert.match(text, /context source:/);
+		assert.match(text, /\bnone: 1\b/);
+		assert.match(text, /\bmanual: 1\b/);
+		assert.match(text, /\bsnapshot: 1\b/);
+		assert.match(text, /budget:/);
+		assert.match(text, /warn at 3/);
+		assert.match(text, /warn at 5/);
+		assert.match(text, /status: ok/);
+		assert.match(text, /reset with \/pitaj usage reset; counters also reset when the Pi session ends\./);
+	});
+
+	it("marks summary as warning when threshold reached", () => {
+		const store = createUsageStore();
+		for (let i = 0; i < USAGE_BUDGET.lowRisk; i += 1) {
+			store.record({
+				timestamp: i,
+				requestedModel: "auto",
+				resolvedModel: "openai/gpt-5.1",
+				autoRouted: true,
+				routeKind: "auto-low",
+				mode: "answer",
+				brevity: "short",
+				risk: "low",
+				contextSource: "none",
+				contextChars: 0,
+				maxOutputChars: 0,
+				success: true,
+				truncated: false,
+			});
+		}
+		const summary = buildUsageSummary(store.snapshot());
+		assert.equal(summary.budgetStatus, "warning");
+		assert.deepEqual(summary.warningsReached, ["low-risk"]);
+		const text = formatUsageSummaryText(summary);
+		assert.match(text, /status: warning/);
+		assert.match(text, /warnings reached: low-risk/);
+	});
+
+	it("exposes a stable description for every route kind", () => {
+		const expected = [
+			"auto-low",
+			"auto-high",
+			"auto-risk-check",
+			"explicit-low",
+			"explicit-high",
+			"explicit-other",
+			"snapshot",
+			"error",
+		];
+		for (const kind of expected) {
+			const label = describeRouteKind(kind as Parameters<typeof describeRouteKind>[0]);
+			assert.ok(typeof label === "string" && label.length > 0, `missing label for ${kind}`);
+		}
+	});
+
+	it("applies warning flags via the pure helper", () => {
+		const before = { lowRisk: 2, highRisk: 0, snapshot: 4, lowRiskWarned: false, highRiskWarned: false, snapshotWarned: false };
+		const after = applyUsageWarningFlags(before);
+		assert.equal(after.lowRiskWarned, false);
+		assert.equal(after.snapshotWarned, false);
+
+		const after2 = applyUsageWarningFlags({ ...before, lowRisk: 3, snapshot: 5 });
+		assert.equal(after2.lowRiskWarned, true);
+		assert.equal(after2.snapshotWarned, true);
+	});
+	it("returns no warnings when under every threshold", () => {
+		const totals = { lowRisk: 2, highRisk: 0, snapshot: 4, lowRiskWarned: false, highRiskWarned: false, snapshotWarned: false };
+		const w = buildInlineWarnings(totals);
+		assert.equal(w.length, 0);
+	});
+
+	it("returns low-risk warning when lowRiskWarned is true", () => {
+		const totals = { lowRisk: 3, highRisk: 0, snapshot: 0, lowRiskWarned: true, highRiskWarned: false, snapshotWarned: false };
+		const w = buildInlineWarnings(totals);
+		assert.equal(w.length, 1);
+		assert.match(w[0], /low-risk\/GPT-style consult/);
+		assert.match(w[0], /\/pitaj usage/);
+		assert.match(w[0], /\/pitaj usage reset/);
+	});
+
+	it("returns high-risk warning when highRiskWarned is true", () => {
+		const totals = { lowRisk: 0, highRisk: 3, snapshot: 0, lowRiskWarned: false, highRiskWarned: true, snapshotWarned: false };
+		const w = buildInlineWarnings(totals);
+		assert.equal(w.length, 1);
+		assert.match(w[0], /high-risk\/Opus-style consult/);
+	});
+
+	it("returns snapshot warning when snapshotWarned is true", () => {
+		const totals = { lowRisk: 0, highRisk: 0, snapshot: 5, lowRiskWarned: false, highRiskWarned: false, snapshotWarned: true };
+		const w = buildInlineWarnings(totals);
+		assert.equal(w.length, 1);
+		assert.match(w[0], /snapshot consult/);
+		assert.match(w[0], /bounded but still context-heavy/);
+	});
+
+	it("returns multiple warnings when multiple thresholds are reached", () => {
+		const totals = { lowRisk: 3, highRisk: 3, snapshot: 5, lowRiskWarned: true, highRiskWarned: true, snapshotWarned: true };
+		const w = buildInlineWarnings(totals);
+		assert.equal(w.length, 3);
+	});
+
+	it("pluralises consult count correctly", () => {
+		const one = { lowRisk: 1, highRisk: 0, snapshot: 0, lowRiskWarned: true, highRiskWarned: false, snapshotWarned: false };
+		const two = { lowRisk: 2, highRisk: 0, snapshot: 0, lowRiskWarned: true, highRiskWarned: false, snapshotWarned: false };
+		assert.match(buildInlineWarnings(one)[0], /consult in this session/);
+		assert.match(buildInlineWarnings(two)[0], /consults in this session/);
 	});
 });

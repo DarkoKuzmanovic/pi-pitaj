@@ -133,3 +133,14 @@ Future PMTI decisions should use milestone-scoped IDs such as `M1-a` and cite ta
 **Rationale:** The five logical tasks remain useful as acceptance criteria, but per-task packet/handoff/review ceremony is too slow for this milestone. The safety-critical boundary is before interactive persistent settings writes, so one review after Batch A and one final review after Batch B preserves the important gate while reducing overhead.
 
 **Consequences:** Batch A must be verified and reviewed before Batch B starts. If Batch A changes or reopens the settings contract, pause for orchestrator/human decision before any interactive writer work. Worker handoffs should still preserve stop-on-ambiguity, workspace verification, and bounded fix-back rules.
+
+## P0-e — Use execution lanes to tune PMTI ceremony
+
+**Date:** 2026-06-01
+**Status:** accepted
+
+**Decision:** Adopt the PMTI execution-lanes policy in `.pi/pmti/project/execution-lanes.md`: Fast lane for narrow reversible verified work, Review lane for user-visible/state/routing/contract changes, and Oracle lane for architecture, privacy, process, or hard-to-reverse choices.
+
+**Rationale:** M3-B1 and M3-B2 showed that full per-task ceremony is too slow, but skipping review on state, routing, and error semantics lets mistakes compound. Lanes make the review level explicit and let autonomous work keep moving while preserving fresh-context review at dependency boundaries.
+
+**Consequences:** Future milestone and task packets should name their lane and required gates. Fast-lane tasks may use optional/sampled review after verification; Review-lane tasks require fresh-context review before the next dependent batch; Oracle-lane work requires oracle review before task packets or implementation. Worker failures should feed back into worker prompts or agent instructions before the next comparable dispatch.
