@@ -20,6 +20,9 @@ import {
 	PITAJ_BREVITIES,
 	PITAJ_MODES,
 	classifySpecialCommand,
+	formatResultForDisplay,
+	buildInlineWarnings,
+	applyUsageWarningFlags,
 	resolveAutoRoute,
 	resolveMaxOutputChars,
 	resolveModelRef,
@@ -31,11 +34,13 @@ import {
 	type PitajAutoRisk,
 	type PitajBrevity,
 	type PitajMode,
+	isAdviseFlagViolation,
 	type PitajSettings,
 	type ParsedCommandArgs,
 } from "./helpers.ts";
 import { buildRuntimeSnapshotInput, SnapshotToolResultBuffer, registerSnapshotToolResultCapture, type SnapshotRuntimeSessionManager } from "./snapshot-runtime.ts";
 import { buildSnapshotContext, type SnapshotCategory, type SnapshotCategoryMetadata } from "./snapshot.ts";
+import { createUsageRecorder } from "./usage.ts";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const SETTINGS_PATH = join(EXTENSION_DIR, "settings.json");
@@ -65,6 +70,8 @@ interface PitajResultDetails {
 	question: string;
 	contextChars: number;
 	answerChars: number;
+	maxOutputChars: number;
+	answer: string;
 	durationMs: number;
 	settingsPath: string;
 	settingsWarning?: string;
@@ -130,9 +137,14 @@ function usageText(): string {
 		"  /pitaj <alias|provider/model> [--mode <mode>] [--brevity <level>] [-c <context>] <question>",
 		"  /pitaj snapshot <question>",
 		"  /pitaj snapshot <alias|provider/model> [--mode <mode>] [--brevity <level>] <question>",
+		"  /pitaj auto [--risk low|high] [--mode <mode>] [--brevity <level>] [-c <context>] <question>",
+		"  /pitaj advise <question>",
+		"  /pitaj advise accepts only a bare question; use /pitaj snapshot for --mode/--brevity/-c/model options.",
 		"  /pitaj aliases",
 		"  /pitaj models",
 		"  /pitaj check",
+		"  /pitaj usage",
+		"  /pitaj usage reset",
 		"  /pitaj config",
 		"  /pitaj help",
 		"",
@@ -142,6 +154,10 @@ function usageText(): string {
 		"  -c, --context   bounded context for the sidecar model",
 		"  snapshot       build a bounded session snapshot for the sidecar; no full-branch capture or tools",
 		"  config         show effective settings; with UI, edit common settings after confirmation",
+		"  usage          show current-session consult counts and budget status",
+		"  usage reset    clear current-session consult counters",
+		"  auto and advise are reserved subcommand names and cannot be used as alias keys.",
+		"  Advisory thresholds: 3 low-risk, 3 high-risk, 5 snapshot consults per session before a warning appears",
 		"",
 		"Tool auto-routing: use model=\"auto\" with risk=\"low\"|\"high\". Snapshot mode is slash-command only.",
 		"",
@@ -249,6 +265,8 @@ async function consultModel(
 			question,
 			contextChars: context?.length ?? 0,
 			answerChars: answer.length,
+			maxOutputChars,
+			answer,
 			durationMs: Date.now() - startedAt,
 			settingsPath: SETTINGS_PATH,
 			...(resolvedLoaded.warning ? { settingsWarning: resolvedLoaded.warning } : {}),
@@ -258,6 +276,7 @@ async function consultModel(
 		},
 	};
 }
+
 async function runCheck(settings: PitajSettings, ctx: ExtensionContext): Promise<void> {
 	const entries = Object.entries(settings.aliases).sort(([a], [b]) => a.localeCompare(b));
 	if (entries.length === 0) {
@@ -415,10 +434,6 @@ async function runConfigUi(loaded: LoadedSettings, ctx: ExtensionContext): Promi
 	ctx.ui.notify(`pitaj settings saved\n${changes}`, "info");
 }
 
-function formatResultForDisplay(answer: string, details: PitajResultDetails): string {
-	const alias = details.alias ? ` (${details.alias})` : "";
-	return [`pitaj ${details.model}${alias}`, "", answer].join("\n");
-}
 
 export function parseSnapshotCommandArgs(args: string, settings: PitajSettings): ParsedCommandArgs | undefined {
 	const trimmed = args.trim();
@@ -478,11 +493,12 @@ export function buildSnapshotCommandRequest(
 		},
 	};
 }
+
 const PitajParams = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				"Model alias (opus, gpt, mimo, deepseek, glm), explicit provider/model, or 'auto' for built-in routing."
+				"Model alias (opus, gpt, mimo, deepseek, glm), explicit provider/model, or 'auto' for built-in routing.",
 		}),
 	),
 	mode: Type.Optional(
@@ -524,9 +540,49 @@ const PitajParams = Type.Object({
 	),
 });
 
+function buildErrorDetails(params: PitajRequest, loaded: LoadedSettings): PitajResultDetails {
+	return {
+		model: params.model ?? "unknown",
+		alias: undefined,
+		mode: params.mode ?? "answer",
+		brevity: params.brevity ?? "normal",
+		question: params.question,
+		contextChars: params.context?.length ?? 0,
+		answerChars: 0,
+		maxOutputChars: resolveMaxOutputChars(params.maxOutputChars, loaded.settings, params.brevity ?? loaded.settings.defaultBrevity),
+		answer: "",
+		durationMs: 0,
+		settingsPath: SETTINGS_PATH,
+		settingsWarning: loaded.warning,
+		autoRouted: false,
+		autoSuggestedMode: undefined,
+	};
+}
+
 export default function pitaj(pi: ExtensionAPI): void {
 	const snapshotToolResults = new SnapshotToolResultBuffer();
 	registerSnapshotToolResultCapture(pi, snapshotToolResults);
+	const usageRecorder = createUsageRecorder();
+	function recordUsageFromDetails(
+		params: PitajRequest,
+		details: PitajResultDetails,
+		outcome: { success: boolean; truncated?: boolean },
+	): void {
+		usageRecorder.recordFromRequest({
+			requestedModel: params.model,
+			resolvedModel: details.model,
+			...(details.alias ? { resolvedAlias: details.alias } : {}),
+			mode: details.mode,
+			brevity: details.brevity,
+			...(params.risk ? { risk: params.risk } : {}),
+			autoRouted: details.autoRouted === true,
+			contextChars: details.contextChars,
+			hasSnapshot: details.snapshot !== undefined,
+			maxOutputChars: details.maxOutputChars,
+			success: outcome.success,
+			truncated: outcome.truncated === true,
+		});
+	}
 	pi.registerTool({
 		name: "pitaj",
 		label: "Pitaj",
@@ -544,11 +600,21 @@ export default function pitaj(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			onUpdate?.({ content: [{ type: "text", text: "pitaj is asking..." }] });
 			const loaded = loadSettings();
-			const result = await consultModel(params, ctx, signal, loaded, onUpdate);
-			return {
-				content: [{ type: "text", text: result.answer }],
-				details: result.details,
-			};
+			try {
+				const result = await consultModel(params, ctx, signal, loaded, onUpdate);
+				recordUsageFromDetails(params, result.details, { success: true });
+				const { totals } = usageRecorder.snapshot();
+				const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
+				return {
+					content: [{ type: "text", text: formatResultForDisplay(result.answer, result.details, { warnings }) }],
+					details: result.details,
+				};
+			} catch (error) {
+				const message = errorMessage(error);
+				recordUsageFromDetails(params, buildErrorDetails(params, loaded), { success: false });
+				ctx.ui.notify(`pitaj failed: ${message}`, "error");
+				throw error instanceof Error ? error : new Error(message);
+			}
 		},
 	});
 
@@ -587,6 +653,158 @@ export default function pitaj(pi: ExtensionAPI): void {
 				return;
 			}
 
+			if (specialCommand === "usage") {
+				const normalizedUsage = trimmed.toLowerCase();
+				if (normalizedUsage === "usage reset") {
+					usageRecorder.reset();
+					ctx.ui.notify("pitaj usage counters reset", "info");
+					return;
+				}
+				ctx.ui.notify(usageRecorder.renderSummary(), "info");
+				return;
+			}
+
+			if (specialCommand === "auto") {
+				const autoArgs = trimmed.substring("auto".length).trim();
+
+				// Extract --risk flag BEFORE parsing (parseCommandArgs doesn't recognize it)
+				let risk: PitajAutoRisk | undefined;
+				const riskMatch = autoArgs.match(/--risk\s+(\S+)/i);
+				if (riskMatch) {
+					const rawRisk = riskMatch[1].toLowerCase();
+					if (rawRisk !== "low" && rawRisk !== "high") {
+						ctx.ui.notify("pitaj auto: --risk must be 'low' or 'high'", "error");
+						return;
+					}
+					risk = rawRisk as PitajAutoRisk;
+				}
+
+				// Strip --risk from args so it doesn't leak into the question or clobber -c context
+				const cleanedArgs = autoArgs.replace(/--risk\s+\S+/i, "").trim();
+				const parsed = parseCommandArgs(cleanedArgs, loaded.settings);
+
+				let question = parsed.question;
+				if (!question && ctx.hasUI) {
+					const edited = await ctx.ui.editor("Question for pitaj auto", "");
+					if (edited === undefined) {
+						ctx.ui.notify("pitaj auto cancelled", "info");
+						return;
+					}
+					question = edited.trim();
+				}
+				if (!question) {
+					ctx.ui.notify(usageText(), "info");
+					return;
+				}
+
+				const autoRequest = {
+					model: "auto" as const,
+					question,
+					mode: parsed.mode,
+					brevity: parsed.brevity,
+					context: parsed.context,
+					risk,
+				};
+
+				ctx.ui.setStatus("pitaj auto", "auto-routing...");
+				try {
+					const result = await consultModel(autoRequest, ctx, undefined, loaded);
+					recordUsageFromDetails(autoRequest, result.details, { success: true });
+					const display = formatResultForDisplay(result.answer, result.details, {});
+					pi.sendMessage({
+						customType: "pitaj",
+						content: display,
+						display: true,
+						details: result.details
+					});
+					ctx.ui.notify(`pitaj auto answered with ${result.details.model}`, "info");
+				} catch (error) {
+					const message = errorMessage(error);
+					recordUsageFromDetails(autoRequest, buildErrorDetails(autoRequest, loaded), { success: false });
+					ctx.ui.notify(`pitaj auto failed: ${message}`, "error");
+				} finally {
+					ctx.ui.setStatus("pitaj auto", undefined);
+				}
+				return;
+			}
+
+			if (specialCommand === "advise") {
+				const adviseInput = trimmed.substring("advise".length).trim();
+
+				// ZERO-FLAG REJECTION
+				const { forbiddenFlags, looksLikeModel } = isAdviseFlagViolation(adviseInput, loaded.settings);
+				if (forbiddenFlags.length > 0 || looksLikeModel) {
+					ctx.ui.notify(
+						"pitaj advise accepts only a bare question — no --mode, --brevity, -c, or model arguments. Use /pitaj snapshot for full options.",
+						"warning",
+					);
+					return;
+				}
+
+				// Editor fallback for empty question
+				let question = adviseInput;
+				if (!question && ctx.hasUI) {
+					const edited = await ctx.ui.editor("Question for pitaj advise", "");
+					if (edited === undefined) {
+						ctx.ui.notify("pitaj advise cancelled", "info");
+						return;
+					}
+					question = edited.trim();
+				}
+				if (!question) {
+					ctx.ui.notify(usageText(), "info");
+					return;
+				}
+
+				// Build snapshot context via existing path
+				const snapshotRequest = buildSnapshotCommandRequest(
+					{
+						question,
+						model: undefined,
+						mode: undefined,
+						brevity: undefined,
+						context: undefined,
+					},
+					loaded.settings,
+					{ sessionManager: ctx.sessionManager, toolResults: snapshotToolResults },
+				);
+
+				ctx.ui.setStatus("pitaj advise", "asking...");
+				try {
+					const result = await consultModel(snapshotRequest.request, ctx, undefined, loaded);
+					const details = { ...result.details, snapshot: snapshotRequest.snapshot };
+					recordUsageFromDetails(snapshotRequest.request, details, {
+						success: true,
+						truncated: snapshotRequest.snapshot.truncated,
+					});
+					const { totals } = usageRecorder.snapshot();
+					const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
+
+					const advisoryContent = formatResultForDisplay(result.answer, details, { warnings, isAdvisory: true });
+
+					pi.sendMessage({
+						customType: "pitaj",
+						content: advisoryContent,
+						display: true,
+						details,
+					});
+					ctx.ui.notify(`pitaj advise answered with ${result.details.model}`, "info");
+				} catch (error) {
+					const message = errorMessage(error);
+					recordUsageFromDetails(
+						snapshotRequest.request,
+						{
+							...buildErrorDetails(snapshotRequest.request, loaded),
+							snapshot: snapshotRequest.snapshot,
+						},
+						{ success: false, truncated: snapshotRequest.snapshot.truncated },
+					);
+					ctx.ui.notify(`pitaj advise failed: ${message}`, "error");
+				} finally {
+					ctx.ui.setStatus("pitaj advise", undefined);
+				}
+				return;
+			}
 			const snapshotParsed = parseSnapshotCommandArgs(trimmed, loaded.settings);
 			if (snapshotParsed) {
 				let question = snapshotParsed.question;
@@ -615,15 +833,20 @@ export default function pitaj(pi: ExtensionAPI): void {
 				try {
 					const result = await consultModel(snapshotRequest.request, ctx, undefined, loaded);
 					const details = { ...result.details, snapshot: snapshotRequest.snapshot };
+					recordUsageFromDetails(snapshotRequest.request, details, { success: true, truncated: snapshotRequest.snapshot.truncated });
+				const { totals } = usageRecorder.snapshot();
+				const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
 					pi.sendMessage({
 						customType: "pitaj",
-						content: formatResultForDisplay(result.answer, details),
+						content: formatResultForDisplay(result.answer, details, { warnings }),
 						display: true,
 						details,
 					});
 					ctx.ui.notify(`pitaj snapshot answered with ${result.details.model}`, "info");
 				} catch (error) {
-					ctx.ui.notify(`pitaj snapshot failed: ${errorMessage(error)}`, "error");
+					const message = errorMessage(error);
+					recordUsageFromDetails(snapshotRequest.request, { ...buildErrorDetails(snapshotRequest.request, loaded), snapshot: snapshotRequest.snapshot }, { success: false, truncated: snapshotRequest.snapshot.truncated });
+					ctx.ui.notify(`pitaj snapshot failed: ${message}`, "error");
 				} finally {
 					ctx.ui.setStatus("pitaj snapshot", undefined);
 				}
@@ -647,29 +870,31 @@ export default function pitaj(pi: ExtensionAPI): void {
 				return;
 			}
 
+			const request: PitajRequest = {
+				model: parsed.model,
+				question,
+				mode: parsed.mode,
+				brevity: parsed.brevity,
+				context: parsed.context,
+			};
+
 			ctx.ui.setStatus("pitaj", "asking...");
 			try {
-				const result = await consultModel(
-					{
-						model: parsed.model,
-						question,
-						mode: parsed.mode,
-						brevity: parsed.brevity,
-						context: parsed.context,
-					},
-					ctx,
-					undefined,
-					loaded,
-				);
+				const result = await consultModel(request, ctx, undefined, loaded);
+				recordUsageFromDetails(request, result.details, { success: true });
+				const { totals } = usageRecorder.snapshot();
+				const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
 				pi.sendMessage({
 					customType: "pitaj",
-					content: formatResultForDisplay(result.answer, result.details),
+					content: formatResultForDisplay(result.answer, result.details, { warnings }),
 					display: true,
 					details: result.details,
 				});
 				ctx.ui.notify(`pitaj answered with ${result.details.model}`, "info");
 			} catch (error) {
-				ctx.ui.notify(`pitaj failed: ${errorMessage(error)}`, "error");
+				const message = errorMessage(error);
+				recordUsageFromDetails(request, buildErrorDetails(request, loaded), { success: false });
+				ctx.ui.notify(`pitaj failed: ${message}`, "error");
 			} finally {
 				ctx.ui.setStatus("pitaj", undefined);
 			}

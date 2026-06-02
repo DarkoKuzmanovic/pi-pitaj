@@ -87,6 +87,10 @@ Tests focus on argument parsing, model resolution, and prompt-shaping behavior.
 - Keep output short, focused, and evidence-based.
 - For configuration/behavior changes, preserve safe defaults and backward compatibility.
 
+### Executor edit discipline
+
+For any executor working in this repo (any model), keep edits structurally safe. Make one logical edit per file, then re-read before the next edit to that file — sequential anchored edits (`replace_lines`/`set_line`) reuse line anchors that shift under prior edits and can silently produce duplicate or orphaned code. For any code file needing more than one change, or a function/block add or remove, rewrite the whole file with `write` instead of stacking anchored edits. After editing, confirm no duplicate declarations, balanced braces/parens, and matching closers; this is a TypeScript ESM module, so use `import` and never `require`. Stop and report after two failed edits on the same file instead of carrying a corrupt file forward.
+
 ## Lessons learned
 
 ### Adjust snapshot metadata after final context bounding
@@ -139,4 +143,16 @@ A milestone is not done until:
 6. Final reviewer verdict and test result are recorded in `.pi/pmti/project/session-log/`.
 
 Oracle is pre-code advisory. Reviewer is post-code. Executor fixes blockers. Automated fix-back is bounded to two rounds before human/orchestrator escalation.
+
+### M4 milestone
+
+**Status:** completed 2026-06-02
+
+M4 added three features:
+- `/pitaj auto` slash command with optional `--risk low|high` (M4-T1)
+- Test split of monolithic `helpers.test.ts` into focused suites (M4-T3)
+- `/pitaj advise` zero-flag advisory shortcut wrapping the curated snapshot builder (M4-T2)
+- Close-out docs and session log (M4-T4)
+
+Guardrail audit confirms M4 added no new capture sources, no persistence, no token/cost accounting, no sidecar tools, and no full-branch capture.
 <!-- END PMTI MANAGED BLOCK -->
