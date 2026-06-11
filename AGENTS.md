@@ -8,40 +8,44 @@ Guidance for AI agents and contributors working on this extension.
 
 ## Architecture
 
-Single-file extension (`index.ts`) with shared helper logic in `helpers.ts`.
+Extension entrypoint (`index.ts`) with shared pure logic in `helpers.ts`, the snapshot subsystem in `snapshot.ts`/`snapshot-runtime.ts`, and usage accounting in `usage.ts`.
 
 ```text
 index.ts                ← Extension entrypoint
-├─ loadSettings()        ← Reads settings.json (with safe fallback)
-├─ parseCommandArgs()    ← Detects optional model token vs. default question
+├─ loadSettings()        ← Reads settings.json (safe fallback + auto-route validation warning)
 ├─ pitaj tool registration← Agent tool: `pitaj`
-├─ /pitaj command        ← User slash command bridge with optional editor fallback
-└─ consultModel()        ← Resolves model, validates auth, calls `complete()`
+├─ /pitaj command        ← Slash command with subcommands (auto, advise, snapshot, config, usage, check)
+└─ consultModel()        ← Resolves model, validates auth, streams via `stream()`, finalizes the answer
 
-helpers.ts              ← Validation + settings normalization + prompt builders
-├─ DEFAULT_SETTINGS
-├─ settingsFromUnknown()
-├─ mergeSettings()
-├─ resolveModelRef()
-├─ buildConsultSystemPrompt()
-├─ buildConsultUserText()
-└─ truncateText()
+helpers.ts              ← Pure logic: settings, parsing, prompts, formatting, usage accounting
+├─ settingsFromUnknown() / mergeSettings() / validateAutoRouteAliases()
+├─ resolveModelRef() / resolveAutoRoute()
+├─ parseCommandArgs() / classifySpecialCommand() / isAdviseFlagViolation()
+├─ buildConsultSystemPrompt() / buildConsultUserText() / truncateText()
+├─ finalizeConsultAnswer() ← stopReason policy: error/aborted throw, length is marked truncated
+├─ formatResultForDisplay() / formatUsageSummaryText()
+└─ createUsageStore() / buildUsageSummary()
 
+snapshot.ts             ← Pure bounded session-snapshot context builder
+snapshot-runtime.ts     ← Runtime collection seam (session tree, tool-result buffer)
+usage.ts                ← createUsageRecorder() bridging usage store to tool/command call sites
 settings.json           ← Runtime model aliases / defaults
 ```
 
 ### Runtime flow
 
 1. User invokes `/pitaj ...` or calls the tool directly.
-2. `settings.json` is loaded and merged with defaults; malformed files fall back to defaults with a warning.
+2. `settings.json` is loaded and merged with defaults; malformed files fall back to defaults with a warning. Auto-route aliases (`autoRouteLow`/`autoRouteHigh`) are validated at load time — a missing alias produces a settings warning immediately, not on the first `/pitaj auto` call.
 3. Input is parsed as:
    - `pitaj <alias|provider/model> <question>`
    - or bare question using `defaultModel`.
 4. `resolveModelRef()` maps aliases to provider/model IDs.
 5. Model is resolved through `ctx.modelRegistry` and API credentials are loaded.
 6. A compact prompt is built (mode + brevity, optional context, optional truncation).
-7. `complete()` runs the consultation and returns text.
-8. Answer is returned and displayed by Pi.
+7. `stream()` runs the consultation; `finalizeConsultAnswer()` turns the stream outcome into a final answer or a loud failure:
+   - `stopReason: "error"` / `"aborted"` → throw (a dead stream is never returned as a normal answer; the error carries the provider message and partial-text size)
+   - `stopReason: "length"` → answer returned but visibly marked as provider-truncated, `truncated` recorded in details and usage
+8. Answer is returned and displayed by Pi; usage is recorded (including a truncated-answers count shown by `/pitaj usage`).
 
 ## Configuration
 
@@ -53,6 +57,7 @@ settings.json           ← Runtime model aliases / defaults
 - `maxContextChars`
 - `maxOutputChars`
 - `aliases` map (e.g., `opus`, `deepseek`, `mimo`, `glm`)
+- `autoRouteLow` / `autoRouteHigh` (alias names used by `model: "auto"` routing; validated at load time)
 
 Example:
 

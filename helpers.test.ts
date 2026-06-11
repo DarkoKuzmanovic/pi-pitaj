@@ -491,53 +491,9 @@ describe("brevity output scaling", () => {
 	});
 });
 
-describe("pitaj tool wiring contract", () => {
-	const indexSource = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-
-	it("intercepts literal auto before model resolution and registry lookup", () => {
-		const autoRouteIndex = indexSource.indexOf("const autoRoute = request.model?.trim().toLowerCase() === \"auto\"");
-		const resolveIndex = indexSource.indexOf("resolveModelRef(autoRoute?.alias ?? request.model, settings)");
-		const registryIndex = indexSource.indexOf("ctx.modelRegistry.find");
-
-		assert.notEqual(autoRouteIndex, -1);
-		assert.notEqual(resolveIndex, -1);
-		assert.notEqual(registryIndex, -1);
-		assert.ok(autoRouteIndex < resolveIndex);
-		assert.ok(resolveIndex < registryIndex);
-	});
-
-	it("exposes auto routing schema and result metadata", () => {
-		assert.match(indexSource, /risk: Type\.Optional\(\s*StringEnum\(PITAJ_AUTO_RISKS,/s);
-		assert.match(indexSource, /autoRouted\?: boolean;/);
-		assert.match(indexSource, /routingReason\?: string;/);
-		assert.match(indexSource, /autoSuggestedMode\?: PitajMode;/);
-		assert.match(indexSource, /autoRouted: true, routingReason: autoRoute\.routingReason/);
-	});
-
-
-	it("routes snapshot command through generated context without tool schema changes", () => {
-		const snapshotParseIndex = indexSource.indexOf("const snapshotParsed = parseSnapshotCommandArgs(trimmed, loaded.settings)");
-		const normalParseIndex = indexSource.indexOf("const parsed = parseCommandArgs(trimmed, loaded.settings)");
-		assert.notEqual(snapshotParseIndex, -1);
-		assert.notEqual(normalParseIndex, -1);
-		assert.ok(snapshotParseIndex < normalParseIndex);
-		assert.match(indexSource, /buildSnapshotCommandRequest\([\s\S]*sessionManager: ctx\.sessionManager,[\s\S]*toolResults: snapshotToolResults/s);
-		assert.match(indexSource, /consultModel\(snapshotRequest\.request, ctx, undefined, loaded\)/);
-		assert.match(indexSource, /snapshot: snapshotRequest\.snapshot/);
-		assert.doesNotMatch(indexSource, /autoContext/);
-		assert.doesNotMatch(indexSource, /snapshot:\s*Type/);
-		const snapshotSource = readFileSync(new URL("./snapshot.ts", import.meta.url), "utf8");
-		const runtimeSource = readFileSync(new URL("./snapshot-runtime.ts", import.meta.url), "utf8");
-		assert.doesNotMatch(`${indexSource}\n${snapshotSource}\n${runtimeSource}`, /getBranch\(|getEntries\(/);
-		assert.doesNotMatch(`${indexSource}\n${snapshotSource}\n${runtimeSource}`, /full-branch by default|sidecar tools|tool-enabled snapshot/i);
-	});
-
-	it("documents snapshot command in slash help", () => {
-		assert.match(indexSource, /\/pitaj snapshot <question>/);
-		assert.match(indexSource, /bounded session snapshot/);
-	});
-});
-
+// The former "pitaj tool wiring contract" describe lived here: it grepped
+// index.ts source text for expected strings. Replaced by executable behavior
+// tests in consult-behavior.test.ts (consultModel through a fake stream).
 describe("pitaj /pitaj config command classification", () => {
 	it("classifies config as a special command", () => {
 		assert.equal(classifySpecialCommand("config"), "config");

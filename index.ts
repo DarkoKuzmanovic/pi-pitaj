@@ -35,6 +35,8 @@ import {
 	type PitajBrevity,
 	type PitajMode,
 	isAdviseFlagViolation,
+	finalizeConsultAnswer,
+	validateAutoRouteAliases,
 	type PitajSettings,
 	type ParsedCommandArgs,
 } from "./helpers.ts";
@@ -76,6 +78,8 @@ interface PitajResultDetails {
 	settingsPath: string;
 	settingsWarning?: string;
 	stopReason?: string;
+	/** Answer was provider-truncated (stopReason "length") or clipped at maxOutputChars. */
+	truncated?: boolean;
 	autoRouted?: boolean;
 	routingReason?: string;
 	autoSuggestedMode?: PitajMode;
@@ -108,12 +112,12 @@ function errorMessage(error: unknown): string {
 
 function loadSettings(): LoadedSettings {
 	if (!existsSync(SETTINGS_PATH)) {
-		return { settings: mergeSettings(), fileState: "not-found" };
+		return withAutoRouteWarning({ settings: mergeSettings(), fileState: "not-found" });
 	}
 
 	try {
 		const parsed = JSON.parse(readFileSync(SETTINGS_PATH, "utf-8")) as unknown;
-		return { settings: mergeSettings(settingsFromUnknown(parsed)), fileState: "loaded" };
+		return withAutoRouteWarning({ settings: mergeSettings(settingsFromUnknown(parsed)), fileState: "loaded" });
 	} catch (error) {
 		return {
 			settings: mergeSettings(),
@@ -121,6 +125,13 @@ function loadSettings(): LoadedSettings {
 			warning: `Could not read pitaj settings.json; using built-in defaults. ${errorMessage(error)}`,
 		};
 	}
+}
+
+/** Attach the auto-route misconfiguration warning at load time, not first-consult time. */
+function withAutoRouteWarning(loaded: LoadedSettings): LoadedSettings {
+	const warning = validateAutoRouteAliases(loaded.settings);
+	if (!warning) return loaded;
+	return { ...loaded, warning: loaded.warning ? `${loaded.warning} ${warning}` : warning };
 }
 
 function formatAliasList(settings: PitajSettings): string {
@@ -179,12 +190,14 @@ function getTextContent(message: Message): string {
 		.join("\n");
 }
 
-async function consultModel(
+/** Exported for behavior tests; `streamImpl` is a DI seam for a fake stream. */
+export async function consultModel(
 	request: PitajRequest,
 	ctx: ExtensionContext,
 	signal: AbortSignal | undefined,
 	loaded?: LoadedSettings,
 	onUpdate?: (update: { content: { type: "text"; text: string }[] }) => void,
+	streamImpl: typeof stream = stream,
 ): Promise<{ answer: string; details: PitajResultDetails }> {
 	const resolvedLoaded = loaded ?? loadSettings();
 	const settings = resolvedLoaded.settings;
@@ -222,7 +235,7 @@ async function consultModel(
 		timestamp: startedAt,
 	};
 
-	const streamResponse = stream(
+	const streamResponse = streamImpl(
 		model,
 		{
 			systemPrompt: buildConsultSystemPrompt(mode, brevity),
@@ -232,6 +245,7 @@ async function consultModel(
 	);
 
 	let accumulatedText = "";
+	let streamError: unknown;
 	try {
 		for await (const event of streamResponse) {
 			if (event.type === "text_delta") {
@@ -239,21 +253,30 @@ async function consultModel(
 				onUpdate?.({ content: [{ type: "text", text: accumulatedText }] });
 			}
 		}
-	} catch {
-		// If streaming fails, result() still contains the partial/error response
+	} catch (error) {
+		// result() still carries the final message; keep the thrown error only
+		// to enrich the failure message finalizeConsultAnswer throws.
+		streamError = error;
 	}
 	const response = await streamResponse.result();
-
-	if (response.stopReason === "aborted") {
-		throw new Error("pitaj consult was aborted.");
-	}
 
 	const rawAnswer = getTextContent({
 		role: "assistant",
 		content: response.content,
 		timestamp: Date.now(),
 	});
-	const answer = truncateText(rawAnswer.trim() || "(pitaj returned no text)", maxOutputChars);
+	// Throws on stopReason "aborted"/"error" — a dead stream must never be
+	// returned as a normal answer. "length" comes back visibly marked.
+	const { answer, truncated } = finalizeConsultAnswer(
+		{
+			...(response.stopReason ? { stopReason: response.stopReason } : {}),
+			...(response.errorMessage ? { errorMessage: response.errorMessage } : {}),
+			rawText: rawAnswer,
+			partialChars: accumulatedText.length,
+			...(streamError instanceof Error ? { streamErrorMessage: streamError.message } : {}),
+		},
+		maxOutputChars,
+	);
 
 	return {
 		answer,
@@ -271,6 +294,7 @@ async function consultModel(
 			settingsPath: SETTINGS_PATH,
 			...(resolvedLoaded.warning ? { settingsWarning: resolvedLoaded.warning } : {}),
 			...(response.stopReason ? { stopReason: response.stopReason } : {}),
+			...(truncated ? { truncated: true } : {}),
 			...(autoRoute ? { autoRouted: true, routingReason: autoRoute.routingReason } : {}),
 			...(autoRoute?.suggestedMode ? { autoSuggestedMode: autoRoute.suggestedMode } : {}),
 		},
@@ -566,7 +590,7 @@ export default function pitaj(pi: ExtensionAPI): void {
 	function recordUsageFromDetails(
 		params: PitajRequest,
 		details: PitajResultDetails,
-		outcome: { success: boolean; truncated?: boolean },
+		outcome: { success: boolean },
 	): void {
 		usageRecorder.recordFromRequest({
 			requestedModel: params.model,
@@ -580,7 +604,9 @@ export default function pitaj(pi: ExtensionAPI): void {
 			hasSnapshot: details.snapshot !== undefined,
 			maxOutputChars: details.maxOutputChars,
 			success: outcome.success,
-			truncated: outcome.truncated === true,
+			// "truncated" tracks answer integrity (provider length-stop or local
+			// clip), not snapshot-context truncation — that lives in details.snapshot.
+			truncated: details.truncated === true,
 		});
 	}
 	pi.registerTool({
@@ -773,10 +799,7 @@ export default function pitaj(pi: ExtensionAPI): void {
 				try {
 					const result = await consultModel(snapshotRequest.request, ctx, undefined, loaded);
 					const details = { ...result.details, snapshot: snapshotRequest.snapshot };
-					recordUsageFromDetails(snapshotRequest.request, details, {
-						success: true,
-						truncated: snapshotRequest.snapshot.truncated,
-					});
+					recordUsageFromDetails(snapshotRequest.request, details, { success: true });
 					const { totals } = usageRecorder.snapshot();
 					const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
 
@@ -797,7 +820,7 @@ export default function pitaj(pi: ExtensionAPI): void {
 							...buildErrorDetails(snapshotRequest.request, loaded),
 							snapshot: snapshotRequest.snapshot,
 						},
-						{ success: false, truncated: snapshotRequest.snapshot.truncated },
+						{ success: false },
 					);
 					ctx.ui.notify(`pitaj advise failed: ${message}`, "error");
 				} finally {
@@ -833,7 +856,7 @@ export default function pitaj(pi: ExtensionAPI): void {
 				try {
 					const result = await consultModel(snapshotRequest.request, ctx, undefined, loaded);
 					const details = { ...result.details, snapshot: snapshotRequest.snapshot };
-					recordUsageFromDetails(snapshotRequest.request, details, { success: true, truncated: snapshotRequest.snapshot.truncated });
+					recordUsageFromDetails(snapshotRequest.request, details, { success: true });
 				const { totals } = usageRecorder.snapshot();
 				const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
 					pi.sendMessage({
@@ -845,7 +868,7 @@ export default function pitaj(pi: ExtensionAPI): void {
 					ctx.ui.notify(`pitaj snapshot answered with ${result.details.model}`, "info");
 				} catch (error) {
 					const message = errorMessage(error);
-					recordUsageFromDetails(snapshotRequest.request, { ...buildErrorDetails(snapshotRequest.request, loaded), snapshot: snapshotRequest.snapshot }, { success: false, truncated: snapshotRequest.snapshot.truncated });
+					recordUsageFromDetails(snapshotRequest.request, { ...buildErrorDetails(snapshotRequest.request, loaded), snapshot: snapshotRequest.snapshot }, { success: false });
 					ctx.ui.notify(`pitaj snapshot failed: ${message}`, "error");
 				} finally {
 					ctx.ui.setStatus("pitaj snapshot", undefined);
