@@ -164,6 +164,14 @@ Alias editing is manual in M2: edit `settings.json` directly, then run `/pitaj c
 - `maxContextChars` optional max chars sent from context
 - `maxOutputChars` optional max chars returned
 
+### Failure behavior
+
+A consult that dies mid-stream is never returned as a normal answer:
+
+- provider error or abort → the tool call fails loudly, with the provider's error message and how much partial text had streamed before the failure
+- provider stops at its max output tokens → the answer is returned but visibly marked `⚠ provider stopped at max output tokens`, and counted under `truncated answers` in `/pitaj usage`
+- misconfigured `autoRouteLow`/`autoRouteHigh` aliases are reported as a settings warning at load time, not on the first `auto` call
+
 ## Settings
 
 `settings.json` is loaded from the extension folder.
@@ -199,6 +207,7 @@ pitaj usage (current session)
 
 total consults: 5
 errors: 0
+truncated answers: 0
 
 routes:
   auto (low-risk): 3

@@ -172,6 +172,27 @@ export function mergeSettings(overrides: Partial<PitajSettings> = {}): PitajSett
 	};
 }
 
+/**
+ * Config-load-time check that the auto-route aliases point at configured
+ * aliases. Returns a warning string rather than throwing: the consult path
+ * still fails loudly at use time, but the user should learn at load time,
+ * not on the first `/pitaj auto` call.
+ */
+export function validateAutoRouteAliases(settings: PitajSettings): string | undefined {
+	const problems: string[] = [];
+	const routes = [
+		["autoRouteLow", settings.autoRouteLow ?? DEFAULT_AUTO_ROUTE_LOW],
+		["autoRouteHigh", settings.autoRouteHigh ?? DEFAULT_AUTO_ROUTE_HIGH],
+	] as const;
+	for (const [field, alias] of routes) {
+		if (!settings.aliases[alias]?.trim()) {
+			problems.push(`${field} points at alias "${alias}" which is not defined in aliases`);
+		}
+	}
+	if (problems.length === 0) return undefined;
+	return `pitaj auto-routing misconfigured: ${problems.join("; ")}. /pitaj auto will fail until settings.json is fixed.`;
+}
+
 function parseProviderModel(ref: string): { provider: string; modelId: string } | undefined {
 	const slashIndex = ref.indexOf("/");
 	if (slashIndex <= 0 || slashIndex === ref.length - 1) return undefined;
@@ -291,7 +312,8 @@ export function isAdviseFlagViolation(
 	const tokens = adviseInput.split(/\s+/);
 	const firstToken = tokens[0]?.toLowerCase();
 	const forbiddenFlags = ["--mode", "-m", "--brevity", "-b", "--context", "-c"];
-	const hasForbiddenFlags = forbiddenFlags.filter((f) => tokens.includes(f));
+	// Match both spaced (`--mode plan`) and inline (`--mode=plan`) forms.
+	const hasForbiddenFlags = forbiddenFlags.filter((f) => tokens.some((t) => t === f || t.startsWith(`${f}=`)));
 	const looksLikeModel =
 		firstToken && (firstToken.includes("/") || settings.aliases[firstToken]);
 	return {
@@ -357,6 +379,12 @@ export function parseCommandArgs(args: string, settings: PitajSettings): ParsedC
 
 /** Split on whitespace, but merge double-quoted segments into single tokens (quotes stripped). */
 function tokenizeWithQuotes(input: string): string[] {
+	// An unbalanced quote would silently corrupt every token after the stray
+	// character; fall back to plain whitespace splitting instead.
+	const quoteCount = (input.match(/"/g) ?? []).length;
+	if (quoteCount % 2 !== 0) {
+		return input.split(/\s+/).filter(Boolean);
+	}
 	const tokens: string[] = [];
 	let current = "";
 	let inQuotes = false;
@@ -527,6 +555,50 @@ export function truncateText(text: string, maxChars: number): string {
 	const head = text.slice(0, Math.max(0, maxChars));
 	const omitted = text.length - head.length;
 	return `${head}\n\n[pitaj truncated ${omitted} characters]`;
+}
+
+/** Stream outcome facts `consultModel` extracts from the pi-ai response. */
+export interface ConsultStreamOutcome {
+	stopReason?: string;
+	errorMessage?: string;
+	/** Full text content extracted from the final response message. */
+	rawText: string;
+	/** Chars accumulated from text deltas before the stream ended/failed. */
+	partialChars: number;
+	/** Message of the error thrown by the stream iterator, if any. */
+	streamErrorMessage?: string;
+}
+
+/**
+ * Turn a finished consult stream into a final answer — or a loud failure.
+ * A consult that died mid-stream must never be returned as a normal answer:
+ * a half-finished risk-check reads as a complete one.
+ *
+ * - `aborted` / `error` → throw (with provider error and partial-size facts)
+ * - `length` → answer returned but visibly marked as provider-truncated
+ * - local `maxOutputChars` clipping also flips `truncated`
+ */
+export function finalizeConsultAnswer(
+	outcome: ConsultStreamOutcome,
+	maxOutputChars: number,
+): { answer: string; truncated: boolean } {
+	if (outcome.stopReason === "aborted") {
+		throw new Error("pitaj consult was aborted.");
+	}
+	if (outcome.stopReason === "error") {
+		const detail = outcome.errorMessage?.trim() || outcome.streamErrorMessage?.trim() || "unknown provider error";
+		throw new Error(
+			`pitaj consult failed mid-stream: ${detail} (received ${outcome.partialChars} chars of partial text before failure)`,
+		);
+	}
+	const trimmed = outcome.rawText.trim();
+	const locallyTruncated = trimmed.length > maxOutputChars;
+	let answer = truncateText(trimmed || "(pitaj returned no text)", maxOutputChars);
+	const providerTruncated = outcome.stopReason === "length";
+	if (providerTruncated) {
+		answer = `${answer}\n\n⚠ [pitaj: provider stopped at max output tokens — answer may be incomplete]`;
+	}
+	return { answer, truncated: providerTruncated || locallyTruncated };
 }
 
 export function buildConsultSystemPrompt(mode: PitajMode, brevity: PitajBrevity): string {
@@ -753,6 +825,8 @@ export interface UsageSummary {
 	byRisk: Record<UsageRisk, number>;
 	byModel: Record<string, number>;
 	errors: number;
+	/** Consults whose answer was provider- or locally truncated. */
+	truncated: number;
 	budget: UsageBudgetState;
 	warningsReached: UsageBudgetGroup[];
 	budgetStatus: "ok" | "warning";
@@ -896,6 +970,7 @@ export function buildUsageSummary(snapshot: UsageStoreSnapshot): UsageSummary {
 	};
 	const byModel: Record<string, number> = {};
 	let errors = 0;
+	let truncated = 0;
 
 	for (const event of snapshot.events) {
 		byRouteKind[event.routeKind] += 1;
@@ -904,6 +979,7 @@ export function buildUsageSummary(snapshot: UsageStoreSnapshot): UsageSummary {
 		const modelKey = event.resolvedAlias ? `${event.resolvedAlias} (${event.resolvedModel})` : event.resolvedModel || event.requestedModel || "unknown";
 		byModel[modelKey] = (byModel[modelKey] ?? 0) + 1;
 		if (!event.success) errors += 1;
+		if (event.truncated) truncated += 1;
 	}
 
 	const warningsReached: UsageBudgetGroup[] = [];
@@ -919,6 +995,7 @@ export function buildUsageSummary(snapshot: UsageStoreSnapshot): UsageSummary {
 		byRisk,
 		byModel,
 		errors,
+		truncated,
 		budget: totals,
 		warningsReached,
 		budgetStatus: warningsReached.length > 0 ? "warning" : "ok",
@@ -990,6 +1067,7 @@ export function formatUsageSummaryText(summary: UsageSummary): string {
 	lines.push("");
 	lines.push(`total consults: ${summary.total}`);
 	lines.push(`errors: ${summary.errors}`);
+	lines.push(`truncated answers: ${summary.truncated}`);
 
 	const routeEntries = (Object.entries(summary.byRouteKind) as [UsageRouteKind, number][])
 		.filter(([, count]) => count > 0)

@@ -1,4 +1,4 @@
-import type { SnapshotBuildInput, SnapshotCategoryInput } from "./snapshot.ts";
+import type { SnapshotBuildInput, SnapshotCategory, SnapshotCategoryInput } from "./snapshot.ts";
 
 const DEFAULT_MAX_TOOL_ITEMS = 5;
 const DEFAULT_MAX_TOOL_ITEM_CHARS = 600;
@@ -154,8 +154,15 @@ function collectRecentUserRequest(
 	return undefined;
 }
 
+/**
+ * Custom categories the runtime seam accepts. Adding a snapshot category
+ * requires touching SNAPSHOT_CATEGORY_ORDER, SNAPSHOT_CAPTURE_POLICIES, and
+ * (if runtime-suppliable) this list — the drift test asserts they stay aligned.
+ */
+export const RUNTIME_CUSTOM_CATEGORIES: readonly SnapshotCategory[] = ["active-plan", "risks"];
+
 function isAllowedCustomRuntimeCategory(input: SnapshotCategoryInput): boolean {
-	return input.category === "active-plan" || input.category === "risks";
+	return (RUNTIME_CUSTOM_CATEGORIES as readonly string[]).includes(input.category);
 }
 
 function getUserMessageText(entry: SessionEntryLike): string | undefined {
