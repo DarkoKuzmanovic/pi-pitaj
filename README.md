@@ -156,7 +156,7 @@ Alias editing is manual in M2: edit `settings.json` directly, then run `/pitaj c
 ### Parameters
 
 - `question` **required**
-- `model` optional: alias (`opus`, `gpt`, `mimo`, `deepseek`, `glm`), explicit `provider/model`, or `auto` for built-in routing.
+- `model` optional: alias (`opus`, `gpt`, `deepseek`, `glm`), explicit `provider/model`, or `auto` for built-in routing.
 - `risk` optional: `low` or `high`. Only used when `model` is `auto`. `low` = bounded technical question; `high` = architecture, security, data integrity, or hard-to-reverse decision.
 - `mode`: `answer` | `critique` | `debug` | `plan` | `risk-check`
 - `context` optional bounded supporting context. pitaj is a sidecar consult without tools — it cannot inspect files unless you provide context.
@@ -189,7 +189,6 @@ A consult that dies mid-stream is never returned as a normal answer:
     "opus": "anthropic/claude-opus-4-8",
     "gpt": "openai-codex/gpt-5.5",
     "opus47": "anthropic/claude-opus-4-7",
-    "mimo": "mimo/mimo-v2.5-pro",
     "deepseek": "deepseek/deepseek-v4-pro",
     "glm": "zai/glm-5.1",
     "spark": "openai-codex/codex-5.3-spark",
@@ -296,7 +295,7 @@ npm test
 
 ## Troubleshooting
 
-- If `/pitaj` asks for a model and your alias is unknown, use `opus`, `gpt`, `mimo`, `deepseek`, `glm`, or pass a full `provider/model` reference.
+- If `/pitaj` asks for a model and your alias is unknown, use `opus`, `gpt`, `deepseek`, `glm`, or pass a full `provider/model` reference.
 - On parse/config issues, run `/pitaj config show`; if `settings.json` is malformed, fix it manually because `/pitaj config` refuses to overwrite malformed files.
 - If a model lookup fails, check model registration in Pi model configuration.
 - If `/pitaj snapshot` has too little context, remember that active-plan and risk categories are omitted unless explicitly supplied, and recent tool results only appear after the bounded ring buffer has captured tool completions.

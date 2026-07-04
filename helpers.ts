@@ -95,7 +95,6 @@ export const DEFAULT_SETTINGS: PitajSettings = {
 	aliases: {
 		opus: "anthropic/claude-opus-4-8",
 		opus47: "anthropic/claude-opus-4-7",
-		mimo: "mimo/mimo-v2.5-pro",
 		deepseek: "deepseek/deepseek-v4-pro",
 		glm: "zai/glm-5.1",
 		spark: "openai-codex/codex-5.3-spark",

@@ -56,7 +56,7 @@ settings.json           ← Runtime model aliases / defaults
 - `defaultBrevity` (`short` | `normal` | `detailed`)
 - `maxContextChars`
 - `maxOutputChars`
-- `aliases` map (e.g., `opus`, `deepseek`, `mimo`, `glm`)
+- `aliases` map (e.g., `opus`, `deepseek`, `glm`)
 - `autoRouteLow` / `autoRouteHigh` (alias names used by `model: "auto"` routing; validated at load time)
 
 Example:
