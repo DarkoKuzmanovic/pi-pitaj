@@ -250,7 +250,7 @@ describe("pitaj M2 config summary and validation helpers", () => {
 		assert.equal(summary.effective.maxOutputChars, undefined);
 		assert.equal(summary.effective.autoRouteLow, "gpt");
 		assert.equal(summary.effective.autoRouteHigh, "opus");
-		assert.equal(summary.aliasCount, 8);
+		assert.equal(summary.aliasCount, 7);
 	});
 
 	it("marks summary with a not-found file state when settings are defaults only", () => {
@@ -276,7 +276,7 @@ describe("pitaj M2 config summary and validation helpers", () => {
 		assert.match(text, /defaultModel: opus/);
 		assert.match(text, /autoRouteLow: gpt/);
 		assert.match(text, /autoRouteHigh: opus/);
-		assert.match(text, /aliases: 8/);
+		assert.match(text, /aliases: 7/);
 		assert.match(text, /settings\.json/);
 	});
 

@@ -522,7 +522,7 @@ const PitajParams = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				"Model alias (opus, gpt, mimo, deepseek, glm), explicit provider/model, or 'auto' for built-in routing.",
+				"Model alias (opus, gpt, deepseek, glm), explicit provider/model, or 'auto' for built-in routing.",
 		}),
 	),
 	mode: Type.Optional(
