@@ -204,7 +204,7 @@ describe("pitaj M2 config contract", () => {
 		const settings = mergeSettings({
 			autoRouteLow: "spark",
 			autoRouteHigh: "opus47",
-			aliases: { spark: "openai-codex/codex-5.3-spark", opus47: "anthropic/claude-opus-4-7" },
+			aliases: { spark: "openai-codex/gpt-5.3-codex-spark", opus47: "anthropic/claude-opus-4-7" },
 		});
 		assert.equal(resolveAutoRoute({ risk: "low" }, settings).alias, "spark");
 		assert.equal(resolveAutoRoute({ risk: "high" }, settings).alias, "opus47");
@@ -324,7 +324,7 @@ describe("interactive config update helpers", () => {
 	});
 
 	it("requires auto-route targets to name existing aliases", () => {
-		const settings = mergeSettings({ aliases: { spark: "openai-codex/codex-5.3-spark" } });
+		const settings = mergeSettings({ aliases: { spark: "openai-codex/gpt-5.3-codex-spark" } });
 		assert.equal(applyConfigUpdate(settings, "autoRouteLow", "spark").autoRouteLow, "spark");
 		assert.throws(() => applyConfigUpdate(settings, "autoRouteHigh", "missing"), /existing alias/);
 	});

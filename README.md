@@ -191,7 +191,7 @@ A consult that dies mid-stream is never returned as a normal answer:
     "opus47": "anthropic/claude-opus-4-7",
     "deepseek": "deepseek/deepseek-v4-pro",
     "glm": "zai/glm-5.1",
-    "spark": "openai-codex/codex-5.3-spark",
+    "spark": "openai-codex/gpt-5.3-codex-spark",
     "mm": "minimax/MiniMax-M2.7-highspeed"
   }
 }
