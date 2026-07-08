@@ -282,7 +282,7 @@ When advisory thresholds are reached, `warning: ...` lines are appended after th
 npm test
 ```
 
-- Unit tests cover model alias resolution, command parsing, prompt shaping, snapshot context building, runtime snapshot capture, snapshot command wiring, config settings semantics, and config update helpers.
+- Unit tests cover model alias resolution and auto-routing, command/flag parsing, prompt shaping, snapshot context building and runtime capture, snapshot command wiring, config settings semantics and updates, consult stopReason/error-handling integrity, and usage/budget accounting.
 
 ## Files
 
@@ -290,8 +290,13 @@ npm test
 - `helpers.ts` — settings parsing, model alias resolution, config helper logic, prompt builders.
 - `snapshot.ts` — pure snapshot contract and context builder.
 - `snapshot-runtime.ts` — bounded runtime snapshot collection seam and tool-result ring buffer.
+- `usage.ts` — usage-event recorder wrapping the in-memory usage store; `index.ts` owns one instance per extension setup.
 - `settings.json` — default model/mode/alias configuration.
-- `helpers.test.ts` — test coverage.
+- `helpers.test.ts` — prompt shaping, command/config classification, advise flag violations, snapshot contract/runtime/wiring, brevity scaling, and M3 result-block/usage-accounting tests.
+- `settings.test.ts` — settings parsing, model aliases, M2 config contract, config summary/validation, and interactive config-update tests.
+- `consult-behavior.test.ts` — `finalizeConsultAnswer`/`consultModel` stopReason integrity via fake streams, auto-route alias validation, parsing robustness, truncated-usage summary, and snapshot category drift guard.
+- `auto-routing.test.ts` — `resolveAutoRoute` pure-function tests.
+- `parsing.test.ts` — command and flag parsing tests.
 
 ## Troubleshooting
 
