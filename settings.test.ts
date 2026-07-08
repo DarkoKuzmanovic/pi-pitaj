@@ -75,7 +75,7 @@ describe("pitaj settings and model aliases", () => {
 			});
 			const { totals } = recorder.snapshot();
 			const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
-			const text = formatResultForDisplay("Answer", { model: "openai/gpt-5.1", answer: "Answer" }, { warnings });
+			const text = formatResultForDisplay("Answer", { model: "openai/gpt-5.1", mode: "answer", brevity: "short", contextChars: 0 }, { warnings });
 			assert.equal(warnings.length, 0);
 			assert.match(text, /^Answer$/m);
 		});
@@ -98,7 +98,7 @@ describe("pitaj settings and model aliases", () => {
 			}
 			const { totals } = recorder.snapshot();
 			const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
-			const text = formatResultForDisplay("Answer", { model: "openai/gpt-5.1", answer: "Answer" }, { warnings });
+			const text = formatResultForDisplay("Answer", { model: "openai/gpt-5.1", mode: "answer", brevity: "short", contextChars: 0 }, { warnings });
 			assert.equal(warnings.length, 1);
 			assert.match(warnings[0], /low-risk\/GPT-style consult/);
 			assert.match(text, /^Answer$/m);
@@ -124,7 +124,7 @@ describe("pitaj settings and model aliases", () => {
 			}
 			const { totals } = recorder.snapshot();
 			const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
-			const text = formatResultForDisplay("Answer", { model: "anthropic/claude-opus-4-8", answer: "Answer" }, { warnings });
+			const text = formatResultForDisplay("Answer", { model: "anthropic/claude-opus-4-8", mode: "answer", brevity: "short", contextChars: 0 }, { warnings });
 			assert.equal(warnings.length, 1);
 			assert.match(warnings[0], /snapshot consult/);
 			assert.match(warnings[0], /bounded but still context-heavy/);
@@ -149,7 +149,7 @@ describe("pitaj settings and model aliases", () => {
 			}
 			const { totals } = recorder.snapshot();
 			const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
-			const text = formatResultForDisplay("Answer", { model: "anthropic/claude-opus-4-8", answer: "Answer" }, { warnings });
+			const text = formatResultForDisplay("Answer", { model: "anthropic/claude-opus-4-8", mode: "answer", brevity: "short", contextChars: 0 }, { warnings });
 			assert.equal(warnings.length, 1);
 			assert.match(warnings[0], /high-risk\/Opus-style consult/);
 			assert.match(text, /^Answer$/m);
