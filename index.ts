@@ -736,7 +736,9 @@ export default function pitaj(pi: ExtensionAPI): void {
 				try {
 					const result = await consultModel(autoRequest, ctx, undefined, loaded);
 					recordUsageFromDetails(autoRequest, result.details, { success: true });
-					const display = formatResultForDisplay(result.answer, result.details, {});
+					const { totals } = usageRecorder.snapshot();
+					const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
+					const display = formatResultForDisplay(result.answer, result.details, { warnings });
 					pi.sendMessage({
 						customType: "pitaj",
 						content: display,

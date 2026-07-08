@@ -113,7 +113,7 @@ describe("pitaj command routing", () => {
 });
 
 describe("pitaj advise flag violation", () => {
-	const settings = mergeSettings({}, {
+	const settings = mergeSettings({
 		defaultModel: "gpt",
 		defaultMode: "answer",
 		defaultBrevity: "normal",
