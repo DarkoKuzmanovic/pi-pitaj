@@ -5,6 +5,29 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.2.0] — planned
+
+### Added
+
+- **Oracle-lite mode** (`mode: "oracle"`) — bounded, read-only evidence consultation against an explicitly approved Git repository root (`oracleRoot`). No cwd fallback and no automatic root selection.
+- Host-mediated evidence tool `pitaj_request_evidence` with exactly four operations: `read_file`, `search`, `list_files`, and `git_diff`. All paths are root-relative and read-only.
+- Hard evidence budgets: 3 requests per consultation (override down to 1 via `maxEvidenceRequests`), 4,000 characters per result, 12,000 characters total. The 4th request is refused deterministically.
+- Filesystem defense-in-depth: `realpath`/`lstat` ancestor checks, leaf `O_NOFOLLOW` opens, `fstat` regular-file verification, and a case-insensitive denylist for sensitive names and paths (`.git`, `.env*`, `.ssh`, `.aws`, `*secret*`, `*token*`, `*password*`, `*.pem`, `*.key`, etc.).
+- `git_diff` uses `--name-status -z` for robust path parsing and runs with `--no-ext-diff --no-textconv` to disable external helpers.
+- `PITAJ_NEEDS_HOST_ACTION` protocol marker: when the sidecar needs an action outside its capability, it emits a structured marker (`PITAJ_NEEDS_HOST_ACTION`, `action: ...`, `reason: ...`) and stops; the host/main model must decide, perform the action outside Pitaj, and re-consult with bounded output if needed.
+- Capability honesty: Oracle system prompt and result details advertise `readOnlyEvidence: true`, the exact operation list, and the explicit budget. Ordinary modes continue to state that Pitaj has no tools and cannot inspect files unless context is provided.
+- Installation guidance updated to recommend the pinned `pi install git:github.com/DarkoKuzmanovic/pi-pitaj@v0.2.0` ref and to explain that unpinned `git:` installs follow the default branch (`main`).
+
+### Changed
+
+- `mode` schema now includes `"oracle"`. `oracleRoot` is required for Oracle mode; `maxEvidenceRequests` is optional and clamped 1..3.
+- Prompt guidelines now qualify that ordinary modes are tool-less and that Oracle mode requires an explicit approved `oracleRoot`.
+
+### Notes
+
+- This release assumes a stable checkout: the approved `oracleRoot` must not be concurrently attacker-writable. The adapter rejects traversal and deterministic symlink escapes, but concurrent mid-path swaps are out of scope.
+- Sensitive-path denial and content scanning are conservative mitigations, not complete secret detection.
+
 ## [0.1.1] — 2026-07-09
 
 ### Fixed
