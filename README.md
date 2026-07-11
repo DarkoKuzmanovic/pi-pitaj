@@ -244,7 +244,7 @@ Sensitive-path denial and content scanning are conservative, case-insensitive mi
 A consult that dies mid-stream is never returned as a normal answer:
 
 - provider error or abort → the tool call fails loudly, with the provider's error message and how much partial text had streamed before the failure
-- provider stops at its max output tokens → the answer is returned but visibly marked `⚠ provider stopped at max output tokens`, and counted under `truncated answers` in `/pitaj usage`
+- provider stops at its max output tokens → the answer is returned but visibly marked `⚠ [pitaj: provider stopped at max output tokens — answer may be incomplete]`, and counted under `truncated answers` in `/pitaj usage`
 - misconfigured `autoRouteLow`/`autoRouteHigh` aliases → reported as a settings warning at load time, not on the first `auto` call
 
 ## Settings
