@@ -6,10 +6,12 @@
   "maxOutputChars": 4000,
   "aliases": {
     "opus": "anthropic/claude-opus-4-8",
-    "gpt": "openai-codex/gpt-5.5",
     "opus47": "anthropic/claude-opus-4-7",
+    "fable": "anthropic/claude-fable-5",
+    "terra": "openai-codex/gpt-5.6-terra",
+    "sol": "openai-codex/gpt-5.6-sol",
     "deepseek": "deepseek/deepseek-v4-pro",
-    "glm": "zai/glm-5.1",
+    "glm": "umans/umans-glm-5.2",
     "spark": "openai-codex/gpt-5.3-codex-spark",
     "mm": "minimax/MiniMax-M2.7-highspeed"
   }

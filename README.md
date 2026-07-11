@@ -2,6 +2,8 @@
 
 A tiny [Pi](https://github.com/earendil-works/pi-coding-agent) extension for in-session AI-to-AI consultation.
 
+Changes are tracked in [CHANGELOG.md](CHANGELOG.md).
+
 ## What it does
 
 `pi-pitaj` adds:
