@@ -1,6 +1,6 @@
 # pi-pitaj 0.2.0 — Oracle-lite Release Plan
 
-**Status:** O1–O3 implemented and reviewed; O4 release preparation in progress, publish approval pending
+**Status:** Released as `v0.2.0` on 2026-07-11; GitHub release published, rollback tag `v0.1.1` retained
 **Started-at:** 2026-07-11T11:28:16+02:00
 **Scope tier:** Standard
 **Risk class:** Protected — filesystem evidence, prompt-injection exposure, and public release gates
@@ -141,7 +141,7 @@ Oracle-lite protects against sidecar-supplied traversal, deterministic symlink e
 
 - `dispatches: unavailable` — the run-level counter was not maintained during O1–O3; record this as a process gap rather than inventing a value.
 - `time-to-first-worker: unavailable` — the first-worker timestamp was not recorded when implementation began.
-- `review-bundles: 3 documented in the session handoff` — O1 contract, O2 adapter/loop, and O3 documentation reviews each recorded SHIP; O4 release verification remains.
+- `review-bundles: 3 documented in the session handoff` — O1 contract, O2 adapter/loop, and O3 documentation reviews each recorded SHIP. O4 release verification completed with 202 tests, strict TypeScript, tag, and GitHub release checks.
 - Reviews are outcome-boundary bundles, not one review per task. Unstarted work may be collapsed if new evidence reduces the scope; no started outcome is silently rewritten.
 
 ## Rollback
