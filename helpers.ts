@@ -1,3 +1,9 @@
+import {
+	ORACLE_MAX_EVIDENCE_REQUESTS,
+	ORACLE_MAX_RESULT_CHARS,
+	ORACLE_MAX_TOTAL_CHARS,
+} from "./oracle-policy.ts";
+
 export const PITAJ_MODES = ["answer", "critique", "debug", "plan", "risk-check", "oracle"] as const;
 export const PITAJ_BREVITIES = ["short", "normal", "detailed"] as const;
 
@@ -600,7 +606,11 @@ export function finalizeConsultAnswer(
 	return { answer, truncated: providerTruncated || locallyTruncated };
 }
 
-export function buildConsultSystemPrompt(mode: PitajMode, brevity: PitajBrevity): string {
+export function buildConsultSystemPrompt(
+	mode: PitajMode,
+	brevity: PitajBrevity,
+	maxEvidenceRequests: number = ORACLE_MAX_EVIDENCE_REQUESTS,
+): string {
 	const modeInstruction: Record<PitajMode, string> = {
 		answer: "Answer the question directly. Surface uncertainty instead of over-explaining.",
 		critique: "Critique the proposal. Look for flaws, missed edge cases, and hidden assumptions.",
@@ -621,7 +631,7 @@ export function buildConsultSystemPrompt(mode: PitajMode, brevity: PitajBrevity)
 			"You are pitaj, a fast consultant model called inside an already-running Pi session.",
 			"You are in oracle mode. You have a single bounded evidence tool: pitaj_request_evidence.",
 			"Available evidence operations: read_file, search, list_files, git_diff.",
-			"You may request at most 3 evidence operations. Each result is capped at 4000 characters; total evidence is capped at 12000 characters.",
+			`You may request at most ${maxEvidenceRequests} evidence operations. Each result is capped at ${ORACLE_MAX_RESULT_CHARS} characters; total evidence is capped at ${ORACLE_MAX_TOTAL_CHARS} characters.`,
 			"You cannot run shell commands, write files, access the network, or select a different model.",
 			"If you need an action you cannot perform, output PITAJ_NEEDS_HOST_ACTION with the requested action and reason. Do not pretend the action ran.",
 			"Answer only the asked question. Do not give process narration.",
@@ -755,7 +765,9 @@ export function formatResultForDisplay(
 		}
 	}
 
-	if (details.snapshot) {
+	if (details.mode === "oracle") {
+		footerLines.push("sidecar: bounded read-only evidence; host actions are not automatic");
+	} else if (details.snapshot) {
 		footerLines.push("sidecar: no tools / no file access (snapshot context only)");
 	} else if (details.contextChars > 0) {
 		footerLines.push("sidecar: no tools / no file access (caller-provided context only)");

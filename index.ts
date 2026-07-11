@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { stream, StringEnum, type Message } from "@earendil-works/pi-ai";
+import { stream, StringEnum, type AssistantMessage, type Message, type ToolResultMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -43,6 +43,16 @@ import {
 import { buildRuntimeSnapshotInput, SnapshotToolResultBuffer, registerSnapshotToolResultCapture, type SnapshotRuntimeSessionManager } from "./snapshot-runtime.ts";
 import { buildSnapshotContext, type SnapshotCategory, type SnapshotCategoryMetadata } from "./snapshot.ts";
 import { createUsageRecorder } from "./usage.ts";
+import { PITAJ_EVIDENCE_TOOL, PITAJ_EVIDENCE_TOOL_NAME, approveOracleRoot, executeOracleEvidence } from "./oracle.ts";
+import {
+	checkEvidenceBudget,
+	clampEvidenceRequestOverride,
+	consumeEvidenceBudget,
+	createOracleBudgetState,
+	ORACLE_MAX_RESULT_CHARS,
+	ORACLE_MAX_TOTAL_CHARS,
+	validateOracleRequest,
+} from "./oracle-policy.ts";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const SETTINGS_PATH = join(EXTENSION_DIR, "settings.json");
@@ -88,6 +98,13 @@ interface PitajResultDetails {
 	routingReason?: string;
 	autoSuggestedMode?: PitajMode;
 	snapshot?: PitajSnapshotDetails;
+	oracle?: {
+		readOnlyEvidence: true;
+		requestLimit: number;
+		requestsUsed: number;
+		totalEvidenceChars: number;
+		hostActionsAutomatic: false;
+	};
 }
 
 export interface PitajSnapshotDetails {
@@ -188,7 +205,7 @@ function usageText(): string {
 	].join("\n");
 }
 
-function getTextContent(message: Message): string {
+function getTextContent(message: AssistantMessage): string {
 	return message.content
 		.flatMap((part) => (part.type === "text" ? [part.text] : []))
 		.join("\n");
@@ -206,12 +223,17 @@ export async function consultModel(
 	const resolvedLoaded = loaded ?? loadSettings();
 	const settings = resolvedLoaded.settings;
 	const question = request.question.trim();
-	if (!question) {
-		throw new Error("pitaj needs a question.");
-	}
+	if (!question) throw new Error("pitaj needs a question.");
+
 	const autoRoute = request.model?.trim().toLowerCase() === "auto"
 		? resolveAutoRoute({ risk: request.risk, mode: request.mode }, settings)
 		: undefined;
+	const mode = request.mode ?? autoRoute?.suggestedMode ?? settings.defaultMode;
+	const oracleValidation = validateOracleRequest({ mode, oracleRoot: request.oracleRoot });
+	if (!oracleValidation.ok) throw new Error(oracleValidation.reason);
+	const oracleRoot = mode === "oracle" ? await approveOracleRoot(request.oracleRoot ?? "") : undefined;
+	const maxEvidenceRequests = clampEvidenceRequestOverride(request.maxEvidenceRequests);
+
 	const resolved = resolveModelRef(autoRoute?.alias ?? request.model, settings);
 	const model = ctx.modelRegistry.find(resolved.provider, resolved.modelId);
 	if (!model) {
@@ -219,64 +241,102 @@ export async function consultModel(
 			`pitaj model is not registered: ${resolved.resolved}. Check ${SETTINGS_PATH} or run /model to confirm the provider/model id.`,
 		);
 	}
-
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-	if (!auth.ok || !auth.apiKey) {
-		throw new Error(auth.ok ? `No API key for ${resolved.resolved}` : auth.error);
-	}
+	if (!auth.ok || !auth.apiKey) throw new Error(auth.ok ? `No API key for ${resolved.resolved}` : auth.error);
 
-	const mode = request.mode ?? autoRoute?.suggestedMode ?? settings.defaultMode;
 	const brevity = request.brevity ?? settings.defaultBrevity;
 	const maxContextChars = request.maxContextChars ?? settings.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS;
 	const maxOutputChars = resolveMaxOutputChars(request.maxOutputChars, settings, brevity);
 	const context = request.context?.trim();
 	const userText = buildConsultUserText(question, context, maxContextChars);
 	const startedAt = Date.now();
-
 	const userMessage: Message = {
 		role: "user",
 		content: [{ type: "text", text: userText }],
 		timestamp: startedAt,
 	};
-
-	const streamResponse = streamImpl(
-		model,
-		{
-			systemPrompt: buildConsultSystemPrompt(mode, brevity),
-			messages: [userMessage],
-		},
-		{ apiKey: auth.apiKey, headers: auth.headers, signal },
-	);
-
-	let accumulatedText = "";
+	const messages: Message[] = [userMessage];
+	let evidenceBudget = createOracleBudgetState();
+	let response: AssistantMessage | undefined;
+	let terminalText = "";
 	let streamError: unknown;
-	try {
-		for await (const event of streamResponse) {
-			if (event.type === "text_delta") {
-				accumulatedText += event.delta;
-				onUpdate?.({ content: [{ type: "text", text: accumulatedText }] });
-			}
-		}
-	} catch (error) {
-		// result() still carries the final message; keep the thrown error only
-		// to enrich the failure message finalizeConsultAnswer throws.
-		streamError = error;
-	}
-	const response = await streamResponse.result();
 
-	const rawAnswer = getTextContent({
-		role: "assistant",
-		content: response.content,
-		timestamp: Date.now(),
-	});
-	// Throws on stopReason "aborted"/"error" — a dead stream must never be
-	// returned as a normal answer. "length" comes back visibly marked.
+	while (true) {
+		const streamResponse = streamImpl(
+			model,
+			mode === "oracle"
+				? {
+					systemPrompt: buildConsultSystemPrompt(mode, brevity, maxEvidenceRequests),
+					messages,
+					tools: [PITAJ_EVIDENCE_TOOL],
+				}
+				: {
+					systemPrompt: buildConsultSystemPrompt(mode, brevity),
+					messages,
+				},
+			{ apiKey: auth.apiKey, headers: auth.headers, signal },
+		);
+		let roundText = "";
+		try {
+			for await (const event of streamResponse) {
+				if (event.type === "text_delta") {
+					roundText += event.delta;
+					onUpdate?.({ content: [{ type: "text", text: roundText }] });
+				}
+			}
+		} catch (error) {
+			streamError = error;
+		}
+		response = await streamResponse.result();
+		terminalText = roundText;
+		if (mode !== "oracle" || response.stopReason !== "toolUse") break;
+
+		const toolCalls = response.content.filter(
+			(part): part is Extract<AssistantMessage["content"][number], { type: "toolCall" }> => part.type === "toolCall",
+		);
+		if (toolCalls.length === 0) throw new Error("Oracle model requested evidence without a tool call.");
+		messages.push(response);
+		let exhausted = false;
+		for (const toolCall of toolCalls) {
+			const check = checkEvidenceBudget(evidenceBudget, maxEvidenceRequests);
+			let result: { content: string; isError: boolean };
+			if (!check.allowed) {
+				evidenceBudget = consumeEvidenceBudget(evidenceBudget, 0);
+				result = { content: `Evidence request refused: ${check.reason}`, isError: true };
+				exhausted = true;
+			} else if (toolCall.name !== PITAJ_EVIDENCE_TOOL_NAME) {
+				evidenceBudget = consumeEvidenceBudget(evidenceBudget, 0);
+				result = { content: "Evidence request refused: unsupported tool name", isError: true };
+			} else {
+				const remainingChars = Math.min(
+					ORACLE_MAX_RESULT_CHARS,
+					ORACLE_MAX_TOTAL_CHARS - evidenceBudget.totalChars,
+				);
+				if (!oracleRoot) throw new Error("Oracle mode is missing its approved repository root.");
+				result = await executeOracleEvidence(oracleRoot, toolCall.arguments as unknown, remainingChars);
+				evidenceBudget = consumeEvidenceBudget(evidenceBudget, result.isError ? 0 : result.content.length);
+			}
+			const toolResult: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				content: [{ type: "text", text: result.content }],
+				isError: result.isError,
+				timestamp: Date.now(),
+			};
+			messages.push(toolResult);
+		}
+		if (exhausted) throw new Error("Oracle evidence request limit reached; no further evidence requests are allowed.");
+	}
+
+	if (!response) throw new Error("pitaj did not produce a response.");
+	const rawAnswer = getTextContent(response);
 	const { answer, truncated } = finalizeConsultAnswer(
 		{
 			...(response.stopReason ? { stopReason: response.stopReason } : {}),
 			...(response.errorMessage ? { errorMessage: response.errorMessage } : {}),
 			rawText: rawAnswer,
-			partialChars: accumulatedText.length,
+			partialChars: terminalText.length,
 			...(streamError instanceof Error ? { streamErrorMessage: streamError.message } : {}),
 		},
 		maxOutputChars,
@@ -294,6 +354,17 @@ export async function consultModel(
 			answerChars: answer.length,
 			maxOutputChars,
 			answer,
+			...(mode === "oracle"
+				? {
+					oracle: {
+						readOnlyEvidence: true as const,
+						requestLimit: maxEvidenceRequests,
+						requestsUsed: evidenceBudget.requestsUsed,
+						totalEvidenceChars: evidenceBudget.totalChars,
+						hostActionsAutomatic: false as const,
+					},
+				}
+				: {}),
 			durationMs: Date.now() - startedAt,
 			settingsPath: SETTINGS_PATH,
 			...(resolvedLoaded.warning ? { settingsWarning: resolvedLoaded.warning } : {}),
@@ -637,14 +708,17 @@ export default function pitaj(pi: ExtensionAPI): void {
 			"Use pitaj with model:'auto', risk:'high' for architectural decisions, security, data-integrity concerns, or hard-to-reverse changes.",
 			"Use explicit aliases (model:'opus', model:'gpt') when you already know which model you need.",
 			"Do not use pitaj for simple facts you can verify locally with read, grep, or bash.",
-			"pitaj is a sidecar consultation, not a subagent. It has no tools and cannot inspect files unless you provide context.",
+			"In ordinary modes, pitaj is a tool-less sidecar and cannot inspect files unless you provide context; explicit mode:'oracle' enables only bounded read-only evidence with a required approved oracleRoot, and host actions remain manual.",
 		],
 		parameters: PitajParams,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			onUpdate?.({ content: [{ type: "text", text: "pitaj is asking..." }] });
+			const contentUpdate = onUpdate
+				? (update: { content: { type: "text"; text: string }[] }) => onUpdate({ ...update, details: undefined })
+				: undefined;
+			contentUpdate?.({ content: [{ type: "text", text: "pitaj is asking..." }] });
 			const loaded = loadSettings();
 			try {
-				const result = await consultModel(params, ctx, signal, loaded, onUpdate);
+				const result = await consultModel(params, ctx, signal, loaded, contentUpdate);
 				recordUsageFromDetails(params, result.details, { success: true });
 				const { totals } = usageRecorder.snapshot();
 				const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
