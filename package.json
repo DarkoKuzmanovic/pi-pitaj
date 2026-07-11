@@ -1,6 +1,6 @@
 {
   "name": "pi-pitaj",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "description": "Ultra-fast in-process model consult extension for Pi",
   "type": "module",
