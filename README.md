@@ -26,7 +26,7 @@ pi install git:github.com/DarkoKuzmanovic/pi-pitaj
 
 # Rollback to the 0.1.1 baseline
 pi install git:github.com/DarkoKuzmanovic/pi-pitaj@v0.1.1
-```text
+```
 
 `git:` installs with no `@ref` follow the repository's default branch (`main`). Use an `@v...` tag when you want a pinned, reviewed release.
 
@@ -44,7 +44,7 @@ Then restart Pi.
 /pitaj models   # same as aliases (for quick config check)
 /pitaj config  # show or edit pitaj settings (UI mode); /pitaj config show is summary-only
 /pitaj help   # show extension usage
-```text
+```
 
 If you run `/pitaj` with no question and UI support is enabled, Pi opens an editor prompt for longer questions.
 
@@ -55,7 +55,7 @@ Use `/pitaj snapshot` when the sidecar needs more than a bare question but you d
 ```text
 /pitaj snapshot Should we keep this implementation boundary?
 /pitaj snapshot opus --mode risk-check --brevity detailed Are there hidden architecture risks?
-```text
+```
 
 Snapshot mode wraps the existing `/pitaj` consult path. It builds a compact, bounded context block and passes it as `context` to the selected model. The sidecar still has no Pi tools and only sees the generated snapshot plus your question. Oracle mode is separate: it requires an explicit `oracleRoot` and exposes only the bounded, read-only `pitaj_request_evidence` tool.
 
@@ -90,7 +90,7 @@ You can also call the registered tool directly:
   "question": "Is this TypeScript narrowing approach sound?",
   "context": "Relevant code excerpt here"
 }
-```text
+```
 
 ### Explicit model calls
 
@@ -102,7 +102,7 @@ You can also call the registered tool directly:
   "context": "Feature: bulk upload validation",
   "brevity": "short"
 }
-```text
+```
 
 ```json
 {
@@ -110,7 +110,7 @@ You can also call the registered tool directly:
   "mode": "debug",
   "question": "Is this API usage pattern correct?"
 }
-```text
+```
 
 **Note:** Auto-routing via `model: "auto"` is available through the tool schema and also via the `/pitaj auto` slash command. Snapshot mode is a slash-command path (`/pitaj snapshot ...`) and does not add a direct tool-schema snapshot parameter.
 
@@ -123,7 +123,7 @@ You can also call the registered tool directly:
   "question": "Does this diff introduce a secret leak?",
   "oracleRoot": "/home/quzma/my-project"
 }
-```text
+```
 
 ### Auto command
 
@@ -133,7 +133,7 @@ Use `/pitaj auto` to route through the built-in auto-router instead of specifyin
 /pitaj auto Is this TypeScript narrowing approach sound?
 /pitaj auto --risk high Is this architecture safe?
 /pitaj auto --risk low --mode debug Check this test assertion
-```text
+```
 
 Auto-routing dispatches based on the `--risk` hint (or the `/pitaj` `risk` field): low risk → GPT-style model; high risk → Opus-style model. When risk is omitted and mode is `risk-check`, it routes to Opus; otherwise defaults to GPT.
 
@@ -146,7 +146,7 @@ Use `/pitaj advise` for a zero-flag advisory shortcut that wraps the curated sna
 ```text
 /pitaj advise Should we keep this implementation boundary?
 /pitaj advise is this safe?
-```text
+```
 
 `/pitaj advise` accepts only a bare question. The flags `--mode`, `--brevity`, `-c`, and model-as-first-argument are rejected with a clear error. Use `/pitaj snapshot` if you need those options.
 
@@ -201,7 +201,7 @@ Budget defaults are hard caps enforced by the host adapter: 3 evidence requests 
   "question": "Is this diff introducing a secret leak?",
   "oracleRoot": "/home/quzma/my-project"
 }
-```text
+```
 
 ### Evidence tool operations
 
@@ -229,7 +229,7 @@ If the sidecar needs something it cannot do, its answer contains a structured ma
 PITAJ_NEEDS_HOST_ACTION
 action: run npm test
 reason: verify the suite passes before we decide
-```text
+```
 
 The host or main model must decide whether that action is authorized, perform it outside Pitaj, and start a fresh bounded consultation with the result. Pitaj does not run the action for you.
 
@@ -266,7 +266,7 @@ A consult that dies mid-stream is never returned as a normal answer:
     "mm": "minimax/MiniMax-M2.7-highspeed"
   }
 }
-```text
+```
 
 ### Usage summary
 
@@ -301,13 +301,13 @@ status: warning
 warnings reached: low-risk
 
 reset with /pitaj usage reset; counters also reset when the Pi session ends.
-```text
+```
 
 Counters reset automatically when your Pi session ends. To reset them manually:
 
 ```text
 /pitaj usage reset
-```text
+```
 
 This clears all in-session consult counters and confirms with `pitaj usage counters reset`.
 
@@ -323,13 +323,13 @@ Warnings are advisory only — no consults are blocked. When a threshold is reac
 
 ```text
 warning: You have sent 3 low-risk/GPT-style consults in this session. Run `/pitaj usage` for details or `/pitaj usage reset` to clear counters.
-```text
+```
 
 Run `/pitaj usage` to see full details or `/pitaj usage reset` to clear counters.
 
 ### Sidecar model limitations
 
-When a second model is consulted, it has no file inspection or tool access unless you explicitly provided that context. Result metadata notes which context was used (none, manual, or snapshot). Do not assume a sidecar model can read your project files unless you included excerpts in your question.
+In ordinary and snapshot modes, a second model has no file inspection or tool access unless you explicitly provide that context. The bounded exception is explicit `mode: "oracle"`, which can use `pitaj_request_evidence` only inside a required approved `oracleRoot`; see [Oracle mode](#oracle-mode). Result metadata notes which context was used (none, manual, snapshot, or Oracle). Do not assume a sidecar model can read your project files unless you either include excerpts or explicitly authorize Oracle mode with its repository root.
 
 ### Result block format
 
@@ -343,7 +343,7 @@ model: openai/gpt-5.1 (gpt)
 route: mode=answer · brevity=short · auto-routed · reason=auto: default → gpt
 context: none
 sidecar: no tools / no file access (no context provided)
-```text
+```
 
 When advisory thresholds are reached, `warning: ...` lines are appended after the metadata.
 
@@ -351,7 +351,7 @@ When advisory thresholds are reached, `warning: ...` lines are appended after th
 
 ```bash
 npm test
-```text
+```
 
 - Unit tests cover model alias resolution and auto-routing, command/flag parsing, prompt shaping, snapshot context building and runtime capture, snapshot command wiring, config settings semantics and updates, consult stopReason/error-handling integrity, and usage/budget accounting.
 
