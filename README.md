@@ -18,8 +18,17 @@ It supports aliases, bounded context + output size, built-in response modes, in-
 From Pi, install this extension from GitHub:
 
 ```bash
+# Exact 0.2.0 release (recommended for reproducible installs)
+pi install git:github.com/DarkoKuzmanovic/pi-pitaj@v0.2.0
+
+# Or follow the default branch (main) for the latest unreleased state
 pi install git:github.com/DarkoKuzmanovic/pi-pitaj
-```
+
+# Rollback to the 0.1.1 baseline
+pi install git:github.com/DarkoKuzmanovic/pi-pitaj@v0.1.1
+```text
+
+`git:` installs with no `@ref` follow the repository's default branch (`main`). Use an `@v...` tag when you want a pinned, reviewed release.
 
 Then restart Pi.
 
@@ -35,7 +44,7 @@ Then restart Pi.
 /pitaj models   # same as aliases (for quick config check)
 /pitaj config  # show or edit pitaj settings (UI mode); /pitaj config show is summary-only
 /pitaj help   # show extension usage
-```
+```text
 
 If you run `/pitaj` with no question and UI support is enabled, Pi opens an editor prompt for longer questions.
 
@@ -46,9 +55,9 @@ Use `/pitaj snapshot` when the sidecar needs more than a bare question but you d
 ```text
 /pitaj snapshot Should we keep this implementation boundary?
 /pitaj snapshot opus --mode risk-check --brevity detailed Are there hidden architecture risks?
-```
+```text
 
-Snapshot mode wraps the existing `/pitaj` consult path. It builds a compact, bounded context block and passes it as `context` to the selected model. The sidecar still has no Pi tools and only sees the generated snapshot plus your question.
+Snapshot mode wraps the existing `/pitaj` consult path. It builds a compact, bounded context block and passes it as `context` to the selected model. The sidecar still has no Pi tools and only sees the generated snapshot plus your question. Oracle mode is separate: it requires an explicit `oracleRoot` and exposes only the bounded, read-only `pitaj_request_evidence` tool.
 
 A snapshot can include:
 
@@ -81,7 +90,7 @@ You can also call the registered tool directly:
   "question": "Is this TypeScript narrowing approach sound?",
   "context": "Relevant code excerpt here"
 }
-```
+```text
 
 ### Explicit model calls
 
@@ -93,7 +102,7 @@ You can also call the registered tool directly:
   "context": "Feature: bulk upload validation",
   "brevity": "short"
 }
-```
+```text
 
 ```json
 {
@@ -101,9 +110,20 @@ You can also call the registered tool directly:
   "mode": "debug",
   "question": "Is this API usage pattern correct?"
 }
-```
+```text
 
 **Note:** Auto-routing via `model: "auto"` is available through the tool schema and also via the `/pitaj auto` slash command. Snapshot mode is a slash-command path (`/pitaj snapshot ...`) and does not add a direct tool-schema snapshot parameter.
+
+### Oracle call
+
+```json
+{
+  "model": "opus",
+  "mode": "oracle",
+  "question": "Does this diff introduce a secret leak?",
+  "oracleRoot": "/home/quzma/my-project"
+}
+```text
 
 ### Auto command
 
@@ -113,7 +133,7 @@ Use `/pitaj auto` to route through the built-in auto-router instead of specifyin
 /pitaj auto Is this TypeScript narrowing approach sound?
 /pitaj auto --risk high Is this architecture safe?
 /pitaj auto --risk low --mode debug Check this test assertion
-```
+```text
 
 Auto-routing dispatches based on the `--risk` hint (or the `/pitaj` `risk` field): low risk → GPT-style model; high risk → Opus-style model. When risk is omitted and mode is `risk-check`, it routes to Opus; otherwise defaults to GPT.
 
@@ -126,7 +146,7 @@ Use `/pitaj advise` for a zero-flag advisory shortcut that wraps the curated sna
 ```text
 /pitaj advise Should we keep this implementation boundary?
 /pitaj advise is this safe?
-```
+```text
 
 `/pitaj advise` accepts only a bare question. The flags `--mode`, `--brevity`, `-c`, and model-as-first-argument are rejected with a clear error. Use `/pitaj snapshot` if you need those options.
 
@@ -160,19 +180,68 @@ Alias editing is manual in M2: edit `settings.json` directly, then run `/pitaj c
 - `question` **required**
 - `model` optional: alias (`opus`, `gpt`, `deepseek`, `glm`), explicit `provider/model`, or `auto` for built-in routing.
 - `risk` optional: `low` or `high`. Only used when `model` is `auto`. `low` = bounded technical question; `high` = architecture, security, data integrity, or hard-to-reverse decision.
-- `mode`: `answer` | `critique` | `debug` | `plan` | `risk-check`
-- `context` optional bounded supporting context. pitaj is a sidecar consult without tools — it cannot inspect files unless you provide context.
+- `mode`: `answer` | `critique` | `debug` | `plan` | `risk-check` | `oracle`
+- `context` optional bounded supporting context. In ordinary modes pitaj is a sidecar consult without tools — it cannot inspect files unless you provide context.
 - `brevity`: `short` | `normal` | `detailed`
 - `maxContextChars` optional max chars sent from context
 - `maxOutputChars` optional max chars returned
+- `oracleRoot` required when `mode` is `oracle`: exact path to an approved Git repository root. There is no cwd fallback.
+- `maxEvidenceRequests` optional when `mode` is `oracle`: override the evidence-request cap (1..3; default 3).
+
+Budget defaults are hard caps enforced by the host adapter: 3 evidence requests per consultation, 4,000 characters per result, 12,000 characters total.
+
+## Oracle mode
+
+`mode: "oracle"` gives the sidecar one bounded, read-only evidence tool: `pitaj_request_evidence`. The tool is host-mediated and operates only inside the `oracleRoot` repository you explicitly approve. There is no cwd fallback and no auto-selected root.
+
+```json
+{
+  "model": "opus",
+  "mode": "oracle",
+  "question": "Is this diff introducing a secret leak?",
+  "oracleRoot": "/home/quzma/my-project"
+}
+```text
+
+### Evidence tool operations
+
+`pitaj_request_evidence` accepts exactly one of these operations:
+
+- `read_file`: read a single regular file, root-relative path, capped at 256 KB before truncation.
+- `search`: grep for a literal pattern across the repository.
+- `list_files`: list directory entries, bounded to 100 entries.
+- `git_diff`: working-tree diff at the approved root, `--no-ext-diff --no-textconv`, with per-path deny/traversal checks.
+
+All paths are root-relative. Absolute paths, parent traversal (`..`), `.git`, and a conservative denylist of sensitive names are rejected. Each result is capped at 4,000 characters and total evidence is capped at 12,000 characters. A 4th request is refused deterministically. You can override the request cap down to 1 with `maxEvidenceRequests`, but not above 3.
+
+### What Oracle mode cannot do
+
+- No shell commands, no file writes, no network access, no Pi tool access.
+- No model selection inside the loop; the model is fixed by your initial call.
+- No recursive Pitaj consultation.
+- No automatic host actions.
+
+### Host-action continuation
+
+If the sidecar needs something it cannot do, its answer contains a structured marker:
+
+```text
+PITAJ_NEEDS_HOST_ACTION
+action: run npm test
+reason: verify the suite passes before we decide
+```text
+
+The host or main model must decide whether that action is authorized, perform it outside Pitaj, and start a fresh bounded consultation with the result. Pitaj does not run the action for you.
+
+### Stable-checkout threat model
+
+Oracle-lite assumes the approved `oracleRoot` checkout is **not concurrently attacker-writable**. The adapter applies canonical-path checks, ancestor `lstat` defense-in-depth, and leaf `O_NOFOLLOW` opens with `fstat` verification to reject traversal and deterministic symlink escapes. It does **not** guarantee defense against concurrent mid-path swaps or hardlinks: do not point `oracleRoot` at a directory another process can modify during the consultation.
+
+Sensitive-path denial and content scanning are conservative, case-insensitive mitigations. They are not complete secret detection: a non-denied path may still contain sensitive data.
 
 ### Failure behavior
 
 A consult that dies mid-stream is never returned as a normal answer:
-
-- provider error or abort → the tool call fails loudly, with the provider's error message and how much partial text had streamed before the failure
-- provider stops at its max output tokens → the answer is returned but visibly marked `⚠ provider stopped at max output tokens`, and counted under `truncated answers` in `/pitaj usage`
-- misconfigured `autoRouteLow`/`autoRouteHigh` aliases are reported as a settings warning at load time, not on the first `auto` call
 
 ## Settings
 
@@ -197,13 +266,13 @@ A consult that dies mid-stream is never returned as a normal answer:
     "mm": "minimax/MiniMax-M2.7-highspeed"
   }
 }
-```
+```text
 
 ### Usage summary
 
 `/pitaj usage` shows a compact summary of your current-session consults:
 
-```
+```text
 pitaj usage (current session)
 
 total consults: 5
@@ -232,13 +301,13 @@ status: warning
 warnings reached: low-risk
 
 reset with /pitaj usage reset; counters also reset when the Pi session ends.
-```
+```text
 
 Counters reset automatically when your Pi session ends. To reset them manually:
 
-```
+```text
 /pitaj usage reset
-```
+```text
 
 This clears all in-session consult counters and confirms with `pitaj usage counters reset`.
 
@@ -252,9 +321,9 @@ pitaj tracks consults in-session and shows compact advisory guidance when thresh
 
 Warnings are advisory only — no consults are blocked. When a threshold is reached, the result block includes a compact line such as:
 
-```
+```text
 warning: You have sent 3 low-risk/GPT-style consults in this session. Run `/pitaj usage` for details or `/pitaj usage reset` to clear counters.
-```
+```text
 
 Run `/pitaj usage` to see full details or `/pitaj usage reset` to clear counters.
 
@@ -266,7 +335,7 @@ When a second model is consulted, it has no file inspection or tool access unles
 
 Consult results are presented answer-first, with compact metadata after a divider:
 
-```
+```text
 Your answer here.
 
 ---
@@ -274,7 +343,7 @@ model: openai/gpt-5.1 (gpt)
 route: mode=answer · brevity=short · auto-routed · reason=auto: default → gpt
 context: none
 sidecar: no tools / no file access (no context provided)
-```
+```text
 
 When advisory thresholds are reached, `warning: ...` lines are appended after the metadata.
 
@@ -282,7 +351,7 @@ When advisory thresholds are reached, `warning: ...` lines are appended after th
 
 ```bash
 npm test
-```
+```text
 
 - Unit tests cover model alias resolution and auto-routing, command/flag parsing, prompt shaping, snapshot context building and runtime capture, snapshot command wiring, config settings semantics and updates, consult stopReason/error-handling integrity, and usage/budget accounting.
 
