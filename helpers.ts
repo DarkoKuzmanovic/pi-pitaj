@@ -1,4 +1,4 @@
-export const PITAJ_MODES = ["answer", "critique", "debug", "plan", "risk-check"] as const;
+export const PITAJ_MODES = ["answer", "critique", "debug", "plan", "risk-check", "oracle"] as const;
 export const PITAJ_BREVITIES = ["short", "normal", "detailed"] as const;
 
 export type PitajMode = (typeof PITAJ_MODES)[number];
@@ -607,6 +607,7 @@ export function buildConsultSystemPrompt(mode: PitajMode, brevity: PitajBrevity)
 		debug: "Debug from evidence. Name likely causes, discriminating checks, and the next smallest test.",
 		plan: "Produce a practical plan with ordered steps, tradeoffs, and validation points.",
 		"risk-check": "List concrete risks, failure modes, and mitigations. Prioritize by likelihood and impact.",
+		oracle: "Investigate using bounded evidence, then answer. Request only what you need.",
 	};
 
 	const brevityInstruction: Record<PitajBrevity, string> = {
@@ -614,6 +615,20 @@ export function buildConsultSystemPrompt(mode: PitajMode, brevity: PitajBrevity)
 		normal: "Use moderate detail, but avoid background the caller did not ask for.",
 		detailed: "Be detailed where it materially improves the decision; still avoid filler.",
 	};
+
+	if (mode === "oracle") {
+		return [
+			"You are pitaj, a fast consultant model called inside an already-running Pi session.",
+			"You are in oracle mode. You have a single bounded evidence tool: pitaj_request_evidence.",
+			"Available evidence operations: read_file, search, list_files, git_diff.",
+			"You may request at most 3 evidence operations. Each result is capped at 4000 characters; total evidence is capped at 12000 characters.",
+			"You cannot run shell commands, write files, access the network, or select a different model.",
+			"If you need an action you cannot perform, output PITAJ_NEEDS_HOST_ACTION with the requested action and reason. Do not pretend the action ran.",
+			"Answer only the asked question. Do not give process narration.",
+			`Mode: ${mode}. ${modeInstruction[mode]}`,
+			`Brevity: ${brevity}. ${brevityInstruction[brevity]}`,
+		].join("\n");
+	}
 
 	return [
 		"You are pitaj, a fast consultant model called inside an already-running Pi session.",

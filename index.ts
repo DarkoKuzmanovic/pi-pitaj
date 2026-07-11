@@ -62,6 +62,10 @@ interface PitajRequest {
 	brevity?: PitajBrevity;
 	maxContextChars?: number;
 	maxOutputChars?: number;
+	/** Required at runtime when mode is "oracle". The host validates this before any evidence operation. */
+	oracleRoot?: string;
+	/** Optional override for the evidence-request cap (1..3). Cannot exceed the hard maximum. */
+	maxEvidenceRequests?: number;
 }
 
 interface PitajResultDetails {
@@ -560,6 +564,19 @@ const PitajParams = Type.Object({
 		Type.Number({
 			description: "Maximum characters to return to the current model. Defaults to settings.json maxOutputChars.",
 			minimum: 1,
+		}),
+	),
+	oracleRoot: Type.Optional(
+		Type.String({
+			description:
+				"Required when mode is 'oracle'. An explicitly approved repository root for bounded read-only evidence. There is no cwd fallback.",
+		}),
+	),
+	maxEvidenceRequests: Type.Optional(
+		Type.Number({
+			description: "Override the evidence-request cap for oracle mode (1..3). Cannot exceed the hard maximum of 3.",
+			minimum: 1,
+			maximum: 3,
 		}),
 	),
 });
