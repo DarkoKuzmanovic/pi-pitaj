@@ -88,5 +88,5 @@ Deliver a working `/pitaj auto [--risk low|high] [existing flags] <question>` sl
 ## Next steps after completion
 
 - Report diff and test output.
-- Request reviewer (`pi-pitaj.opus-medium-reviewer`).
+- Request reviewer.
 - After reviewer approval → M4-B2 (T2 + T4) can begin.
