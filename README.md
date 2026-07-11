@@ -106,7 +106,7 @@ You can also call the registered tool directly:
 
 ```json
 {
-  "model": "gpt",
+  "model": "terra",
   "mode": "debug",
   "question": "Is this API usage pattern correct?"
 }
@@ -178,7 +178,7 @@ Alias editing is manual in M2: edit `settings.json` directly, then run `/pitaj c
 ### Parameters
 
 - `question` **required**
-- `model` optional: alias (`opus`, `gpt`, `deepseek`, `glm`), explicit `provider/model`, or `auto` for built-in routing.
+- `model` optional: a configured alias (`opus`, `opus47`, `fable`, `terra`, `sol`, `deepseek`, `glm`, `spark`, `mm`), explicit `provider/model`, or `auto` for built-in routing.
 - `risk` optional: `low` or `high`. Only used when `model` is `auto`. `low` = bounded technical question; `high` = architecture, security, data integrity, or hard-to-reverse decision.
 - `mode`: `answer` | `critique` | `debug` | `plan` | `risk-check` | `oracle`
 - `context` optional bounded supporting context. In ordinary modes pitaj is a sidecar consult without tools — it cannot inspect files unless you provide context.
@@ -243,9 +243,14 @@ Sensitive-path denial and content scanning are conservative, case-insensitive mi
 
 A consult that dies mid-stream is never returned as a normal answer:
 
+- provider error or abort → the tool call fails loudly, with the provider's error message and how much partial text had streamed before the failure
+- provider stops at its max output tokens → the answer is returned but visibly marked `⚠ provider stopped at max output tokens`, and counted under `truncated answers` in `/pitaj usage`
+- misconfigured `autoRouteLow`/`autoRouteHigh` aliases → reported as a settings warning at load time, not on the first `auto` call
+
 ## Settings
 
 `settings.json` is loaded from the extension folder.
+The snippet mirrors the shipped aliases; aliases are editable and may differ in a local installation. Optional `autoRouteLow` and `autoRouteHigh` fields are supported but omitted here.
 
 ```json
 {
@@ -254,14 +259,14 @@ A consult that dies mid-stream is never returned as a normal answer:
   "defaultBrevity": "short",
   "maxContextChars": 12000,
   "maxOutputChars": 4000,
-  "autoRouteLow": "gpt",
-  "autoRouteHigh": "opus",
   "aliases": {
     "opus": "anthropic/claude-opus-4-8",
-    "gpt": "openai-codex/gpt-5.5",
     "opus47": "anthropic/claude-opus-4-7",
+    "fable": "anthropic/claude-fable-5",
+    "terra": "openai-codex/gpt-5.6-terra",
+    "sol": "openai-codex/gpt-5.6-sol",
     "deepseek": "deepseek/deepseek-v4-pro",
-    "glm": "zai/glm-5.1",
+    "glm": "umans/umans-glm-5.2",
     "spark": "openai-codex/gpt-5.3-codex-spark",
     "mm": "minimax/MiniMax-M2.7-highspeed"
   }
@@ -329,7 +334,7 @@ Run `/pitaj usage` to see full details or `/pitaj usage reset` to clear counters
 
 ### Sidecar model limitations
 
-In ordinary and snapshot modes, a second model has no file inspection or tool access unless you explicitly provide that context. The bounded exception is explicit `mode: "oracle"`, which can use `pitaj_request_evidence` only inside a required approved `oracleRoot`; see [Oracle mode](#oracle-mode). Result metadata notes which context was used (none, manual, snapshot, or Oracle). Do not assume a sidecar model can read your project files unless you either include excerpts or explicitly authorize Oracle mode with its repository root.
+In ordinary and snapshot modes, a second model has no file inspection or tool access unless you explicitly provide that context. The bounded exception is explicit `mode: "oracle"`, which can use `pitaj_request_evidence` only inside a required approved `oracleRoot`; see [Oracle mode](#oracle-mode). Result metadata notes the context source used (none, manual, or snapshot); Oracle capability is shown separately in the sidecar line and result details. Do not assume a sidecar model can read your project files unless you either include excerpts or explicitly authorize Oracle mode with its repository root.
 
 ### Result block format
 
@@ -353,12 +358,14 @@ When advisory thresholds are reached, `warning: ...` lines are appended after th
 npm test
 ```
 
-- Unit tests cover model alias resolution and auto-routing, command/flag parsing, prompt shaping, snapshot context building and runtime capture, snapshot command wiring, config settings semantics and updates, consult stopReason/error-handling integrity, and usage/budget accounting.
+- Unit tests cover model alias resolution and auto-routing, command/flag parsing, prompt shaping, Oracle policy/host evidence/serial tool-loop behavior, snapshot context building and runtime capture, snapshot command wiring, config settings semantics and updates, consult stopReason/error-handling integrity, and usage/budget accounting.
 
 ## Files
 
 - `index.ts` — extension entry, Pi tool/command registration.
 - `helpers.ts` — settings parsing, model alias resolution, config helper logic, prompt builders.
+- `oracle.ts` — approved-root validation, bounded read/search/list/diff adapter, and serial evidence tool-loop seam.
+- `oracle-policy.ts` — pure Oracle request, path, budget, truncation, secret-refusal, and host-action-marker policy.
 - `snapshot.ts` — pure snapshot contract and context builder.
 - `snapshot-runtime.ts` — bounded runtime snapshot collection seam and tool-result ring buffer.
 - `usage.ts` — usage-event recorder wrapping the in-memory usage store; `index.ts` owns one instance per extension setup.
@@ -367,11 +374,13 @@ npm test
 - `settings.test.ts` — settings parsing, model aliases, M2 config contract, config summary/validation, and interactive config-update tests.
 - `consult-behavior.test.ts` — `finalizeConsultAnswer`/`consultModel` stopReason integrity via fake streams, auto-route alias validation, parsing robustness, truncated-usage summary, and snapshot category drift guard.
 - `auto-routing.test.ts` — `resolveAutoRoute` pure-function tests.
+- `oracle-policy.test.ts` — pure Oracle request, path, budget, truncation, secret-refusal, and host-action-marker boundaries.
+- `oracle.test.ts` — temporary-repository adapter checks and serial evidence-loop integration tests.
 - `parsing.test.ts` — command and flag parsing tests.
 
 ## Troubleshooting
 
-- If `/pitaj` asks for a model and your alias is unknown, use `opus`, `gpt`, `deepseek`, `glm`, or pass a full `provider/model` reference.
+- If `/pitaj` asks for a model and your alias is unknown, use a configured alias such as `opus`, `opus47`, `fable`, `terra`, `sol`, `deepseek`, `glm`, `spark`, or `mm`, or pass a full `provider/model` reference.
 - On parse/config issues, run `/pitaj config show`; if `settings.json` is malformed, fix it manually because `/pitaj config` refuses to overwrite malformed files.
 - If a model lookup fails, check model registration in Pi model configuration.
 - If `/pitaj snapshot` has too little context, remember that active-plan and risk categories are omitted unless explicitly supplied, and recent tool results only appear after the bounded ring buffer has captured tool completions.

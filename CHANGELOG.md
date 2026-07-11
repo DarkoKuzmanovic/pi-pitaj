@@ -12,10 +12,10 @@ All notable changes to this project are documented here. Format loosely follows
 - **Oracle-lite mode** (`mode: "oracle"`) — bounded, read-only evidence consultation against an explicitly approved Git repository root (`oracleRoot`). No cwd fallback and no automatic root selection.
 - Host-mediated evidence tool `pitaj_request_evidence` with exactly four operations: `read_file`, `search`, `list_files`, and `git_diff`. All paths are root-relative and read-only.
 - Hard evidence budgets: 3 requests per consultation (override down to 1 via `maxEvidenceRequests`), 4,000 characters per result, 12,000 characters total. The 4th request is refused deterministically.
-- Filesystem defense-in-depth: `realpath`/`lstat` ancestor checks, leaf `O_NOFOLLOW` opens, `fstat` regular-file verification, and a case-insensitive denylist for sensitive names and paths (`.git`, `.env*`, `.ssh`, `.aws`, `*secret*`, `*token*`, `*password*`, `*.pem`, `*.key`, etc.).
+- Filesystem defense-in-depth: `realpath`/`lstat` ancestor checks, leaf `O_NOFOLLOW` opens, `fstat` regular-file verification, and a case-insensitive denylist for sensitive names and paths (`.git`, `.env*`, `.ssh`, `.aws`, `secret*`, `token*`, `password*`, `*.pem`, `*.key`, etc.).
 - `git_diff` uses `--name-status -z` for robust path parsing and runs with `--no-ext-diff --no-textconv` to disable external helpers.
 - `PITAJ_NEEDS_HOST_ACTION` protocol marker: when the sidecar needs an action outside its capability, it emits a structured marker (`PITAJ_NEEDS_HOST_ACTION`, `action: ...`, `reason: ...`) and stops; the host/main model must decide, perform the action outside Pitaj, and re-consult with bounded output if needed.
-- Capability honesty: Oracle system prompt and result details advertise `readOnlyEvidence: true`, the exact operation list, and the explicit budget. Ordinary modes continue to state that Pitaj has no tools and cannot inspect files unless context is provided.
+- Capability honesty: the Oracle system prompt and tool schema advertise the exact four operations and restrictions; result details advertise bounded read-only evidence, request/usage caps, and manual host actions. Ordinary modes continue to state that Pitaj has no tools and cannot inspect files unless context is provided.
 - Installation guidance updated to recommend the pinned `pi install git:github.com/DarkoKuzmanovic/pi-pitaj@v0.2.0` ref and to explain that unpinned `git:` installs follow the default branch (`main`).
 
 ### Changed
