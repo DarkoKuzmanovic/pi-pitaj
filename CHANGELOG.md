@@ -5,6 +5,10 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Changed
+
+- Raised Oracle mode's hard evidence budget from 3 to 9 requests and from 12,000 to 18,000 aggregate characters per consultation. The 4,000-character per-result cap and all read-only/root/sensitive-path protections remain unchanged; the first reached limit still stops further evidence requests.
+
 ## [0.2.0] — 2026-07-11
 
 ### Added

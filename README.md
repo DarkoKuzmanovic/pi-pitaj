@@ -186,9 +186,9 @@ Alias editing is manual in M2: edit `settings.json` directly, then run `/pitaj c
 - `maxContextChars` optional max chars sent from context
 - `maxOutputChars` optional max chars returned
 - `oracleRoot` required when `mode` is `oracle`: exact path to an approved Git repository root. There is no cwd fallback.
-- `maxEvidenceRequests` optional when `mode` is `oracle`: override the evidence-request cap (1..3; default 3).
+- `maxEvidenceRequests` optional when `mode` is `oracle`: override the evidence-request cap (1..9; default 9).
 
-Budget defaults are hard caps enforced by the host adapter: 3 evidence requests per consultation, 4,000 characters per result, 12,000 characters total.
+Budget defaults are hard caps enforced by the host adapter: 9 evidence requests per consultation, 4,000 characters per result, 18,000 characters total. The first reached limit stops further evidence requests.
 
 ## Oracle mode
 
@@ -212,7 +212,7 @@ Budget defaults are hard caps enforced by the host adapter: 3 evidence requests 
 - `list_files`: list directory entries, bounded to 100 entries.
 - `git_diff`: working-tree diff at the approved root, `--no-ext-diff --no-textconv`, with per-path deny/traversal checks.
 
-All paths are root-relative. Absolute paths, parent traversal (`..`), `.git`, and a conservative denylist of sensitive names are rejected. Each result is capped at 4,000 characters and total evidence is capped at 12,000 characters. A 4th request is refused deterministically. You can override the request cap down to 1 with `maxEvidenceRequests`, but not above 3.
+All paths are root-relative. Absolute paths, parent traversal (`..`), `.git`, and a conservative denylist of sensitive names are rejected. Each result is capped at 4,000 characters and aggregate evidence is capped at 18,000 characters. A 10th request is refused deterministically; the aggregate cap may stop an earlier request when prior results are large. You can override the request cap down to 1 with `maxEvidenceRequests`, but not above 9.
 
 ### What Oracle mode cannot do
 

@@ -5,15 +5,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { stream } from "@earendil-works/pi-ai";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { mergeSettings } from "./helpers.ts";
-import { consultModel } from "./index.ts";
+import pitaj, { consultModel } from "./index.ts";
 import {
 	PITAJ_EVIDENCE_TOOL,
 	PITAJ_EVIDENCE_TOOL_NAME,
 	approveOracleRoot,
 	executeOracleEvidence,
 } from "./oracle.ts";
+import { ORACLE_MAX_EVIDENCE_REQUESTS } from "./oracle-policy.ts";
 
 function execGit(cwd: string, args: string[]): Promise<void> {
 	return new Promise((resolve, reject) => {
@@ -176,6 +177,26 @@ const LOADED = {
 	fileState: "loaded" as const,
 };
 
+describe("public pitaj tool schema", () => {
+	it("publishes the same Oracle request maximum as the host policy", () => {
+		let registeredTool: { parameters?: unknown } | undefined;
+		const api = {
+			on() {},
+			registerTool(tool: { parameters?: unknown }) {
+				registeredTool = tool;
+			},
+			registerCommand() {},
+		} as unknown as ExtensionAPI;
+
+		pitaj(api);
+		if (!registeredTool) throw new Error("pitaj did not register its tool");
+		const schema = registeredTool.parameters as {
+			properties: { maxEvidenceRequests: { maximum: number } };
+		};
+		assert.equal(schema.properties.maxEvidenceRequests.maximum, ORACLE_MAX_EVIDENCE_REQUESTS);
+	});
+});
+
 describe("Oracle serial consult loop", () => {
 	it("adds matching tool results in order and re-streams after evidence", async () => {
 		const root = await makeRepository();
@@ -223,10 +244,11 @@ describe("Oracle serial consult loop", () => {
 		assert.equal(calls.length, 0);
 	});
 
-	it("refuses and terminates the fourth evidence request without executing it", async () => {
+	it("refuses and terminates the tenth evidence request without executing it", async () => {
 		const root = await makeRepository();
 		const calls: unknown[][] = [];
 		const step = (id: string): StreamStep => ({ stopReason: "toolUse", toolCall: { id, arguments: { operation: "read_file", path: "source.ts" } } });
+		const evidenceSteps = Array.from({ length: 10 }, (_, index) => step(`call-${index + 1}`));
 		await assert.rejects(
 			consultModel(
 				{ question: "q", model: "opus", mode: "oracle", oracleRoot: root },
@@ -234,11 +256,11 @@ describe("Oracle serial consult loop", () => {
 				undefined,
 				LOADED,
 				undefined,
-				streamSequence([step("one"), step("two"), step("three"), step("four")], calls),
+				streamSequence(evidenceSteps, calls),
 			),
 			/evidence request limit reached/,
 		);
-		assert.equal(calls.length, 4);
+		assert.equal(calls.length, 10);
 	});
 
 	it("keeps auto routing and terminal length behavior in Oracle mode", async () => {

@@ -60,7 +60,12 @@ describe("evidence-request override clamping", () => {
 		assert.equal(clampEvidenceRequestOverride(undefined), ORACLE_MAX_EVIDENCE_REQUESTS);
 	});
 
-	it("clamps values above the hard maximum down to 3", () => {
+	it("uses the approved nine-request and 18,000-character hard caps", () => {
+		assert.equal(ORACLE_MAX_EVIDENCE_REQUESTS, 9);
+		assert.equal(ORACLE_MAX_TOTAL_CHARS, 18_000);
+	});
+
+	it("clamps values above the hard maximum down to 9", () => {
 		assert.equal(clampEvidenceRequestOverride(10), ORACLE_MAX_EVIDENCE_REQUESTS);
 		assert.equal(clampEvidenceRequestOverride(100), ORACLE_MAX_EVIDENCE_REQUESTS);
 	});
@@ -70,10 +75,10 @@ describe("evidence-request override clamping", () => {
 		assert.equal(clampEvidenceRequestOverride(-5), ORACLE_MIN_EVIDENCE_REQUESTS);
 	});
 
-	it("preserves valid values within 1..3", () => {
+	it("preserves valid values within 1..9", () => {
 		assert.equal(clampEvidenceRequestOverride(1), 1);
-		assert.equal(clampEvidenceRequestOverride(2), 2);
-		assert.equal(clampEvidenceRequestOverride(3), 3);
+		assert.equal(clampEvidenceRequestOverride(4), 4);
+		assert.equal(clampEvidenceRequestOverride(9), 9);
 	});
 
 	it("falls back to the hard maximum for non-integers", () => {
@@ -83,11 +88,11 @@ describe("evidence-request override clamping", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Evidence budget — 3 succeeds / 4 refuses
+// Evidence budget — 9 succeeds / 10 refuses
 // ---------------------------------------------------------------------------
 
 describe("oracle evidence budget", () => {
-	it("allows the first three requests", () => {
+	it("allows the first nine requests", () => {
 		let state = createOracleBudgetState();
 		for (let i = 0; i < ORACLE_MAX_EVIDENCE_REQUESTS; i++) {
 			const check = checkEvidenceBudget(state);
@@ -96,14 +101,14 @@ describe("oracle evidence budget", () => {
 		}
 	});
 
-	it("refuses the fourth request", () => {
+	it("refuses the tenth request", () => {
 		let state = createOracleBudgetState();
-		state = consumeEvidenceBudget(state, 100);
-		state = consumeEvidenceBudget(state, 100);
-		state = consumeEvidenceBudget(state, 100);
+		for (let i = 0; i < 9; i++) {
+			state = consumeEvidenceBudget(state, 100);
+		}
 		const check = checkEvidenceBudget(state);
 		assert.equal(check.allowed, false);
-		assert.match(check.reason!, /3\/3 requests used/);
+		assert.match(check.reason!, /9\/9 requests used/);
 	});
 
 	it("refuses when total chars reach the cap even if requests remain", () => {
@@ -117,13 +122,13 @@ describe("oracle evidence budget", () => {
 
 	it("invalid and refused requests still consume the request budget", () => {
 		let state = createOracleBudgetState();
-		// Simulate 3 requests that each returned 0 chars (refused/invalid)
-		state = consumeEvidenceBudget(state, 0);
-		state = consumeEvidenceBudget(state, 0);
-		state = consumeEvidenceBudget(state, 0);
+		// Simulate 9 requests that each returned 0 chars (refused/invalid)
+		for (let i = 0; i < 9; i++) {
+			state = consumeEvidenceBudget(state, 0);
+		}
 		const check = checkEvidenceBudget(state);
 		assert.equal(check.allowed, false);
-		assert.match(check.reason!, /3\/3 requests used/);
+		assert.match(check.reason!, /9\/9 requests used/);
 	});
 
 	it("respects a caller-supplied override lower than the hard maximum", () => {

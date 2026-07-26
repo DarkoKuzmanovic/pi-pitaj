@@ -75,6 +75,10 @@ Example:
 }
 ```
 
+### Oracle evidence budget invariant
+
+Oracle mode requires an explicitly approved repository root and remains limited to host-mediated `read_file`, `search`, `list_files`, and `git_diff`. Its hard budget is 9 evidence requests, 4,000 characters per result, and 18,000 aggregate evidence characters per consultation; the first reached limit stops further requests. `maxEvidenceRequests` may set the request cap to an integer from 1 through 9, never above the hard maximum. Invalid/refused requests still consume a request slot, while all existing root, traversal/symlink, sensitive-path, redaction, and read-only protections remain mandatory.
+
 ## Testing
 
 Run:

@@ -49,6 +49,7 @@ import {
 	clampEvidenceRequestOverride,
 	consumeEvidenceBudget,
 	createOracleBudgetState,
+	ORACLE_MAX_EVIDENCE_REQUESTS,
 	ORACLE_MAX_RESULT_CHARS,
 	ORACLE_MAX_TOTAL_CHARS,
 	validateOracleRequest,
@@ -74,7 +75,7 @@ interface PitajRequest {
 	maxOutputChars?: number;
 	/** Required at runtime when mode is "oracle". The host validates this before any evidence operation. */
 	oracleRoot?: string;
-	/** Optional override for the evidence-request cap (1..3). Cannot exceed the hard maximum. */
+	/** Optional override for the evidence-request cap (1..9). Cannot exceed the hard maximum. */
 	maxEvidenceRequests?: number;
 }
 
@@ -645,9 +646,9 @@ const PitajParams = Type.Object({
 	),
 	maxEvidenceRequests: Type.Optional(
 		Type.Number({
-			description: "Override the evidence-request cap for oracle mode (1..3). Cannot exceed the hard maximum of 3.",
+			description: `Override the evidence-request cap for oracle mode (1..${ORACLE_MAX_EVIDENCE_REQUESTS}). Cannot exceed the hard maximum of ${ORACLE_MAX_EVIDENCE_REQUESTS}.`,
 			minimum: 1,
-			maximum: 3,
+			maximum: ORACLE_MAX_EVIDENCE_REQUESTS,
 		}),
 	),
 });

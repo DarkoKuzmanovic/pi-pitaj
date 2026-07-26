@@ -14,9 +14,9 @@ import { isAbsolute, normalize, sep } from "node:path";
 
 // --- Budget constants (hard maximums; callers cannot raise these) ------------
 
-export const ORACLE_MAX_EVIDENCE_REQUESTS = 3;
+export const ORACLE_MAX_EVIDENCE_REQUESTS = 9;
 export const ORACLE_MAX_RESULT_CHARS = 4_000;
-export const ORACLE_MAX_TOTAL_CHARS = 12_000;
+export const ORACLE_MAX_TOTAL_CHARS = 18_000;
 
 /** Minimum evidence-request override a caller can set. */
 export const ORACLE_MIN_EVIDENCE_REQUESTS = 1;
