@@ -1,6 +1,6 @@
 # Oracle Evidence Budget Increase
 
-**Date:** 2026-07-26  
+**Date:** 2026-07-26
 **Status:** Approved design
 
 ## Goal
