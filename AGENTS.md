@@ -8,7 +8,7 @@ Guidance for AI agents and contributors working on this extension.
 
 ## Architecture
 
-Extension entrypoint (`index.ts`) with shared pure logic in `helpers.ts`, the snapshot subsystem in `snapshot.ts`/`snapshot-runtime.ts`, and usage accounting in `usage.ts`.
+Extension entrypoint (`index.ts`) with shared pure logic in `helpers.ts`, Oracle evidence policy/runtime in `oracle-policy.ts`/`oracle.ts`, the snapshot subsystem in `snapshot.ts`/`snapshot-runtime.ts`, and usage accounting in `usage.ts`.
 
 ```text
 index.ts                ← Extension entrypoint
@@ -25,6 +25,9 @@ helpers.ts              ← Pure logic: settings, parsing, prompts, formatting, 
 ├─ finalizeConsultAnswer() ← stopReason policy: error/aborted throw, length is marked truncated
 ├─ formatResultForDisplay() / formatUsageSummaryText()
 └─ createUsageStore() / buildUsageSummary()
+
+oracle-policy.ts        ← Pure Oracle request, path, budget, truncation, secret-refusal, and host-action policy
+oracle.ts               ← Approved-root validation, bounded evidence adapter, and serial Oracle tool loop
 
 snapshot.ts             ← Pure bounded session-snapshot context builder
 snapshot-runtime.ts     ← Runtime collection seam (session tree, tool-result buffer)
@@ -87,7 +90,7 @@ Run:
 npm test
 ```
 
-Tests focus on argument parsing, model resolution, and prompt-shaping behavior.
+Tests cover parsing/routing, settings writes, prompt and result shaping, consultation stream behavior, snapshots, usage accounting, and Oracle policy/adapter/tool-loop boundaries.
 
 ## Extension conventions
 
@@ -110,58 +113,28 @@ For snapshot/context builders, final whole-context truncation can invalidate per
 
 When a helper intentionally falls back from blank input to defaults, do not use that helper as proof that raw user input is valid for persistence. Validate the submitted value first, then call fallback-aware resolution only after the input has passed the stricter boundary check.
 
-<!-- BEGIN PMTI MANAGED BLOCK -->
-## PMTI project state
+## Crew project state
 
-Canonical PMTI state lives in `.pi/pmti/`.
+This repository uses Crew’s root-file convention:
 
-- Project context: `.pi/pmti/project/`
-- Roadmap: `.pi/pmti/project/roadmap.md`
-- Milestones: `.pi/pmti/milestones/MN.md`
-- Task packets: `.pi/pmti/tasks/<mn-tn-slug>/` (scratch by default)
-- Workspace strategy: see `.pi/pmti/project/decisions.md` and milestone manifests
+- `ROADMAP.md` — release-oriented strategic milestones.
+- `DECISIONS.md` — durable product and architecture rationale.
+- `IDEAS.md` — uncommitted candidates.
+- `docs/specs/*.md` — design and specification documents; each file’s status states whether it is a candidate, approved design, or shipped history.
+- `PLAN.md` — transient execution state for an explicitly authorized active Crew run only.
 
 ### Session orientation
 
-1. Read `.pi/pmti/project/roadmap.md`.
-2. Read the current milestone file under `.pi/pmti/milestones/`.
-3. Read the most recent `.pi/pmti/project/session-log/` entry.
-4. If a milestone was just closed, verify reviewer verdict and full tests before starting the next one.
+1. Read `ROADMAP.md` and `DECISIONS.md`.
+2. If `PLAN.md` exists, resume only that active Crew run and reconstruct the current wave into `todo_write`.
+3. If no `PLAN.md` exists, treat planned roadmap entries and specifications as candidates rather than authorization.
+4. Read the relevant specification before grilling, scope classification, or implementation.
 
-### PMTI routing
+Do not recreate PMTI task packets, milestone manifests, session logs, or a state directory. Completed implementation detail belongs in `CHANGELOG.md` and Git history. Future work follows Crew’s spec → grill offer → scope decision → outcome waves → risk-dominant review → close-out loop.
 
-- Fresh project setup or repair → `pmti-project`.
-- Milestone planning/decomposition → `pmti-milestone`.
-- Executor-ready task packet → `pmti-task`.
-- Trivial direct edits bypass PMTI.
-- If `.pi/project/` exists without `.pi/pmti/`, this is legacy state; do not mix PMTI files in automatically.
+### Product planning guardrails
 
-### Mandatory PMTI preflight
-
-Before PMTI writes, delegation, or handoff, classify: CWD, project state, intent, whether PMTI writes are allowed, and the next required action. Use `ask_user` when scope, migration permission, executor choice, or overwrite behavior is ambiguous. Use `todo_write` for non-trivial PMTI work.
-
-### Milestone close-out
-
-A milestone is not done until:
-
-1. Documentation hygiene is checked.
-2. Implementation is committed as a checkpoint.
-3. `reviewer` reviews the committed diff unless the documented low-risk skip clause applies.
-4. Blocker findings are fixed before the next milestone.
-5. Full tests are rerun after fixes.
-6. Final reviewer verdict and test result are recorded in `.pi/pmti/project/session-log/`.
-
-Oracle is pre-code advisory. Reviewer is post-code. Executor fixes blockers. Automated fix-back is bounded to two rounds before human/orchestrator escalation.
-
-### M4 milestone
-
-**Status:** completed 2026-06-02
-
-M4 added three features:
-- `/pitaj auto` slash command with optional `--risk low|high` (M4-T1)
-- Test split of monolithic `helpers.test.ts` into focused suites (M4-T3)
-- `/pitaj advise` zero-flag advisory shortcut wrapping the curated snapshot builder (M4-T2)
-- Close-out docs and session log (M4-T4)
-
-Guardrail audit confirms M4 added no new capture sources, no persistence, no token/cost accounting, no sidecar tools, and no full-branch capture.
-<!-- END PMTI MANAGED BLOCK -->
+- Keep `pitaj` an explicit, bounded sidecar consultation tool rather than a delegation system.
+- Do not add full active-conversation forwarding without a new decision backed by a concrete unmet use case.
+- Snapshot conveniences must reuse the curated bounded snapshot path and remain advisory.
+- Oracle changes affecting root scope, evidence disclosure, or secret handling are protected-risk work and require the corresponding deep Crew gate.

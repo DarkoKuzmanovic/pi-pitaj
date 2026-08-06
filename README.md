@@ -69,7 +69,7 @@ A snapshot can include:
 
 Snapshot mode deliberately excludes:
 
-- full-branch or full-transcript capture by default;
+- full-branch or full-transcript capture;
 - unbounded session scraping;
 - sidecar access to read/grep/bash or other Pi tools;
 - a direct `pitaj` tool-schema snapshot parameter.

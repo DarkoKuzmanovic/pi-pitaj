@@ -51,6 +51,8 @@ All three issues were found by a full-extension Claude Fable production-truth re
 
 Initial build-out. All of the following landed under this version number, which was never bumped during active development.
 
+The M0–M4 headings in this section are legacy PMTI identifiers, not the release-oriented Crew milestone IDs in `ROADMAP.md`.
+
 ### M0 — MiniMax-friendly auto-routing (2026-05-30)
 
 - `model: "auto"` tool-schema support with deterministic `risk?: "low" | "high"` routing (`resolveAutoRoute()`): `risk: "low"` or omitted risk with a non-`risk-check` mode routes to the `gpt` alias; `risk: "high"` or omitted risk with `mode: "risk-check"` routes to `opus`.
