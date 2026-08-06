@@ -46,7 +46,7 @@ import { createUsageRecorder } from "./usage.ts";
 import { PITAJ_EVIDENCE_TOOL, PITAJ_EVIDENCE_TOOL_NAME, approveOracleRoot, executeOracleEvidence } from "./oracle.ts";
 import {
 	checkEvidenceBudget,
-	clampEvidenceRequestOverride,
+	resolveEvidenceRequestLimit,
 	consumeEvidenceBudget,
 	createOracleBudgetState,
 	ORACLE_MAX_EVIDENCE_REQUESTS,
@@ -232,8 +232,8 @@ export async function consultModel(
 	const mode = request.mode ?? autoRoute?.suggestedMode ?? settings.defaultMode;
 	const oracleValidation = validateOracleRequest({ mode, oracleRoot: request.oracleRoot });
 	if (!oracleValidation.ok) throw new Error(oracleValidation.reason);
-	const oracleRoot = mode === "oracle" ? await approveOracleRoot(request.oracleRoot ?? "") : undefined;
-	const maxEvidenceRequests = clampEvidenceRequestOverride(request.maxEvidenceRequests);
+	const oracleRoot = mode === "oracle" ? await approveOracleRoot(request.oracleRoot ?? "", ctx.cwd) : undefined;
+	const maxEvidenceRequests = resolveEvidenceRequestLimit(request.maxEvidenceRequests);
 
 	const resolved = resolveModelRef(autoRoute?.alias ?? request.model, settings);
 	const model = ctx.modelRegistry.find(resolved.provider, resolved.modelId);
@@ -645,8 +645,8 @@ const PitajParams = Type.Object({
 		}),
 	),
 	maxEvidenceRequests: Type.Optional(
-		Type.Number({
-			description: `Override the evidence-request cap for oracle mode (1..${ORACLE_MAX_EVIDENCE_REQUESTS}). Cannot exceed the hard maximum of ${ORACLE_MAX_EVIDENCE_REQUESTS}.`,
+		Type.Integer({
+			description: `Override the evidence-request cap for oracle mode (whole number, 1..${ORACLE_MAX_EVIDENCE_REQUESTS}). Cannot exceed the hard maximum of ${ORACLE_MAX_EVIDENCE_REQUESTS}.`,
 			minimum: 1,
 			maximum: ORACLE_MAX_EVIDENCE_REQUESTS,
 		}),

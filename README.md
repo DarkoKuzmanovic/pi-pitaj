@@ -57,7 +57,7 @@ Use `/pitaj snapshot` when the sidecar needs more than a bare question but you d
 /pitaj snapshot opus --mode risk-check --brevity detailed Are there hidden architecture risks?
 ```
 
-Snapshot mode wraps the existing `/pitaj` consult path. It builds a compact, bounded context block and passes it as `context` to the selected model. The sidecar still has no Pi tools and only sees the generated snapshot plus your question. Oracle mode is separate: it requires an explicit `oracleRoot` and exposes only the bounded, read-only `pitaj_request_evidence` tool.
+Snapshot mode wraps the existing `/pitaj` consult path. It builds a compact, bounded context block and passes it as `context` to the selected model. The sidecar still has no Pi tools and only sees the generated snapshot plus your question. Oracle mode is separate: it requires an explicit `oracleRoot` equal to the active workspace repository root and exposes only the bounded, read-only `pitaj_request_evidence` tool.
 
 A snapshot can include:
 
@@ -185,14 +185,14 @@ Alias editing is manual in M2: edit `settings.json` directly, then run `/pitaj c
 - `brevity`: `short` | `normal` | `detailed`
 - `maxContextChars` optional max chars sent from context
 - `maxOutputChars` optional max chars returned
-- `oracleRoot` required when `mode` is `oracle`: exact path to an approved Git repository root. There is no cwd fallback.
-- `maxEvidenceRequests` optional when `mode` is `oracle`: override the evidence-request cap (1..9; default 9).
+- `oracleRoot` required when `mode` is `oracle`: exact path to a Git repository root. It must equal the canonical Git top-level of the active Pi workspace (the repository containing the session's working directory). A different repository is rejected before any model request, and there is no cwd fallback.
+- `maxEvidenceRequests` optional when `mode` is `oracle`: override the evidence-request cap with a whole number (1..9; default 9). A fractional or non-finite value is rejected rather than expanded.
 
 Budget defaults are hard caps enforced by the host adapter: 9 evidence requests per consultation, 4,000 characters per result, 18,000 characters total. The first reached limit stops further evidence requests.
 
 ## Oracle mode
 
-`mode: "oracle"` gives the sidecar one bounded, read-only evidence tool: `pitaj_request_evidence`. The tool is host-mediated and operates only inside the `oracleRoot` repository you explicitly approve. There is no cwd fallback and no auto-selected root.
+`mode: "oracle"` gives the sidecar one bounded, read-only evidence tool: `pitaj_request_evidence`. The tool is host-mediated and operates only inside `oracleRoot`, which must be spelled out explicitly and must be the same repository the active Pi session is working in. There is no cwd fallback, no auto-selected root, and no interactive approval prompt: the workspace-root rule is the whole trust boundary. To consult about another repository, start Pi in that repository.
 
 ```json
 {
@@ -208,11 +208,13 @@ Budget defaults are hard caps enforced by the host adapter: 9 evidence requests 
 `pitaj_request_evidence` accepts exactly one of these operations:
 
 - `read_file`: read a single regular file, root-relative path, capped at 256 KB before truncation.
-- `search`: grep for a literal pattern across the repository.
+- `search`: literal-text search over Git-listed candidates — tracked plus non-ignored untracked files (`git ls-files -co --exclude-standard`), optionally narrowed to a root-relative directory. Ignored dependency and build trees are never scanned. Binary candidates (a NUL byte in the initial sample) are skipped, matches are bounded to 100, and at most 500 repository files are examined per request. Candidates that cannot be safely read are skipped without exposing paths or causes, and the result explicitly says when the search is partial.
 - `list_files`: list directory entries, bounded to 100 entries.
-- `git_diff`: working-tree diff at the approved root, `--no-ext-diff --no-textconv`, with per-path deny/traversal checks.
+- `git_diff`: staged plus unstaged changes to tracked files at the approved root. Committed repositories use `git diff HEAD --no-ext-diff --no-textconv`; unborn repositories combine cached and unstaged tracked diffs. Per-path deny/traversal checks apply in both cases. Untracked files are excluded by definition; use `search` or `read_file` for those.
 
 All paths are root-relative. Absolute paths, parent traversal (`..`), `.git`, and a conservative denylist of sensitive names are rejected. Each result is capped at 4,000 characters and aggregate evidence is capped at 18,000 characters. A 10th request is refused deterministically; the aggregate cap may stop an earlier request when prior results are large. You can override the request cap down to 1 with `maxEvidenceRequests`, but not above 9.
+
+Bounded operations report their own limits instead of pretending to be complete: a search that hits the candidate or match bound, or skips unreadable candidates, says so; a search whose Git candidate listing fails returns an explicit refusal rather than an empty no-match; and a diff whose finite aggregate Git output exceeds 256 KB returns an explicit refusal rather than a generic host error.
 
 ### What Oracle mode cannot do
 
@@ -237,7 +239,7 @@ The host or main model must decide whether that action is authorized, perform it
 
 Oracle-lite assumes the approved `oracleRoot` checkout is **not concurrently attacker-writable**. The adapter applies canonical-path checks, ancestor `lstat` defense-in-depth, and leaf `O_NOFOLLOW` opens with `fstat` verification to reject traversal and deterministic symlink escapes. It does **not** guarantee defense against concurrent mid-path swaps or hardlinks: do not point `oracleRoot` at a directory another process can modify during the consultation.
 
-Sensitive-path denial and content scanning are conservative, case-insensitive mitigations. They are not complete secret detection: a non-denied path may still contain sensitive data.
+Sensitive-path denial and content scanning are conservative, case-insensitive mitigations. They are not complete secret detection: a non-denied path may still contain sensitive data. Password scanning refuses assigned credential-looking values (`password: "hunter2secret"`, `PASSWORD=hunter2secret`) while allowing type-only declarations such as `password: string;`.
 
 ### Failure behavior
 

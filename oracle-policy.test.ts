@@ -8,7 +8,7 @@ import {
 	ORACLE_MAX_TOTAL_CHARS,
 	ORACLE_MIN_EVIDENCE_REQUESTS,
 	PITAJ_HOST_ACTION_MARKER,
-	clampEvidenceRequestOverride,
+	resolveEvidenceRequestLimit,
 	containsHostActionMarker,
 	consumeEvidenceBudget,
 	createOracleBudgetState,
@@ -57,7 +57,7 @@ describe("oracle request validation", () => {
 
 describe("evidence-request override clamping", () => {
 	it("returns the hard maximum when no override is given", () => {
-		assert.equal(clampEvidenceRequestOverride(undefined), ORACLE_MAX_EVIDENCE_REQUESTS);
+		assert.equal(resolveEvidenceRequestLimit(undefined), ORACLE_MAX_EVIDENCE_REQUESTS);
 	});
 
 	it("uses the approved nine-request and 18,000-character hard caps", () => {
@@ -66,24 +66,25 @@ describe("evidence-request override clamping", () => {
 	});
 
 	it("clamps values above the hard maximum down to 9", () => {
-		assert.equal(clampEvidenceRequestOverride(10), ORACLE_MAX_EVIDENCE_REQUESTS);
-		assert.equal(clampEvidenceRequestOverride(100), ORACLE_MAX_EVIDENCE_REQUESTS);
+		assert.equal(resolveEvidenceRequestLimit(10), ORACLE_MAX_EVIDENCE_REQUESTS);
+		assert.equal(resolveEvidenceRequestLimit(100), ORACLE_MAX_EVIDENCE_REQUESTS);
 	});
 
 	it("clamps values below the minimum up to 1", () => {
-		assert.equal(clampEvidenceRequestOverride(0), ORACLE_MIN_EVIDENCE_REQUESTS);
-		assert.equal(clampEvidenceRequestOverride(-5), ORACLE_MIN_EVIDENCE_REQUESTS);
+		assert.equal(resolveEvidenceRequestLimit(0), ORACLE_MIN_EVIDENCE_REQUESTS);
+		assert.equal(resolveEvidenceRequestLimit(-5), ORACLE_MIN_EVIDENCE_REQUESTS);
 	});
 
 	it("preserves valid values within 1..9", () => {
-		assert.equal(clampEvidenceRequestOverride(1), 1);
-		assert.equal(clampEvidenceRequestOverride(4), 4);
-		assert.equal(clampEvidenceRequestOverride(9), 9);
+		assert.equal(resolveEvidenceRequestLimit(1), 1);
+		assert.equal(resolveEvidenceRequestLimit(4), 4);
+		assert.equal(resolveEvidenceRequestLimit(9), 9);
 	});
 
-	it("falls back to the hard maximum for non-integers", () => {
-		assert.equal(clampEvidenceRequestOverride(2.5), ORACLE_MAX_EVIDENCE_REQUESTS);
-		assert.equal(clampEvidenceRequestOverride(NaN), ORACLE_MAX_EVIDENCE_REQUESTS);
+	it("rejects fractional and non-finite overrides instead of expanding them", () => {
+		for (const value of [2.5, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+			assert.throws(() => resolveEvidenceRequestLimit(value), /whole number/, `value ${value}`);
+		}
 	});
 });
 
@@ -133,7 +134,7 @@ describe("oracle evidence budget", () => {
 
 	it("respects a caller-supplied override lower than the hard maximum", () => {
 		let state = createOracleBudgetState();
-		const maxRequests = clampEvidenceRequestOverride(2);
+		const maxRequests = resolveEvidenceRequestLimit(2);
 		state = consumeEvidenceBudget(state, 100);
 		state = consumeEvidenceBudget(state, 100);
 		const check = checkEvidenceBudget(state, maxRequests);
@@ -276,6 +277,44 @@ describe("secret pattern scanning", () => {
 		const content = "password: hunter2password";
 		const result = scanForSecrets(content);
 		assert.equal(result.safe, false);
+	});
+
+	it("allows TypeScript password type declarations", () => {
+		const declarations = [
+			"interface Credentials {\n\tpassword: string;\n}",
+			"type Login = { password?: string };",
+			"function connect(password: string) { return password.length; }",
+			"const shape: { password: string | undefined } = load();",
+			"interface Row {\n\tpasswd: string[];\n}",
+			'{ "password": null }',
+		];
+		for (const content of declarations) {
+			assert.equal(scanForSecrets(content).safe, true, content);
+		}
+	});
+
+	it("refuses credential-looking password values in code, JSON, YAML, and env files", () => {
+		const credentials = [
+			'const config = { password: "hunter2secret" };',
+			"PASSWORD=hunter2secret",
+			'{ "password": "hunter2secret" }',
+			"db:\n  password: s3cr3tvalue",
+			"pwd = 'hunter2secret'",
+		];
+		for (const content of credentials) {
+			assert.equal(scanForSecrets(content).safe, false, content);
+		}
+	});
+
+	it("refuses camel-case and later password assignments without rejecting declarations", () => {
+		const bypasses = [
+			'const dbPassword = "hunter2secret";',
+			'let password: string; password = "hunter2secret";',
+			'function f(password: string) { password = "hunter2secret"; }',
+		];
+		for (const content of bypasses) {
+			assert.equal(scanForSecrets(content).safe, false, content);
+		}
 	});
 
 	it("passes clean content unchanged", () => {

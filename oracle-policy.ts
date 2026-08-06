@@ -123,14 +123,20 @@ export function validateOracleRequest(request: {
 }
 
 /**
- * Clamp a caller-supplied evidence-request override to the allowed range.
- * The hard maximum (ORACLE_MAX_EVIDENCE_REQUESTS) can never be raised.
+ * Resolve the caller-supplied evidence-request override into an effective
+ * request limit. Whole numbers are clamped into the allowed range; the hard
+ * maximum (ORACLE_MAX_EVIDENCE_REQUESTS) can never be raised. A fractional or
+ * non-finite override is rejected instead of being expanded to the maximum.
  */
-export function clampEvidenceRequestOverride(
+export function resolveEvidenceRequestLimit(
 	value: number | undefined,
 ): number {
 	if (value === undefined) return ORACLE_MAX_EVIDENCE_REQUESTS;
-	if (!Number.isInteger(value)) return ORACLE_MAX_EVIDENCE_REQUESTS;
+	if (!Number.isInteger(value)) {
+		throw new Error(
+			`maxEvidenceRequests must be a whole number between ${ORACLE_MIN_EVIDENCE_REQUESTS} and ${ORACLE_MAX_EVIDENCE_REQUESTS}.`,
+		);
+	}
 	return Math.min(Math.max(value, ORACLE_MIN_EVIDENCE_REQUESTS), ORACLE_MAX_EVIDENCE_REQUESTS);
 }
 
@@ -293,9 +299,76 @@ const SECRET_PATTERNS: readonly RegExp[] = [
 	/gh[pousr]_[A-Za-z0-9]{36,}/i,
 	// Generic API key / token assignments
 	/(?:api[_-]?key|api[_-]?secret|access[_-]?token|auth[_-]?token|bearer)\s*[:=]\s*["']?[A-Za-z0-9_\-+/=]{20,}["']?/i,
-	// Password assignments with a value
-	/(?:password|passwd|pwd)\s*[:=]\s*\S{4,}/i,
 ];
+
+/**
+ * Candidate assignment key: `password`, `dbPassword`, `passwordHash`,
+ * `"password"`, and the passwd/pwd variants. Filtering the full identifier
+ * rather than requiring a word boundary catches camel-case names without
+ * turning type declarations into credentials on its own.
+ */
+const PASSWORD_ASSIGNMENT_PATTERN = /(?<![A-Za-z0-9_$])([A-Za-z_$][A-Za-z0-9_$]*)["']?\s*\??\s*[:=]/gi;
+
+/**
+ * A value that starts with a TypeScript type-only expression such as `string`,
+ * `string[]`, or `string | undefined`, followed only by a declaration
+ * terminator. This is a type declaration, not an assigned credential.
+ */
+const PASSWORD_TYPE_DECLARATION_PREFIX =
+	/^(?:readonly\s+)?(?:string|number|boolean|bigint|symbol|object|any|unknown|never|null|undefined)(?:\[\])*(?:\s*\|\s*(?:string|number|boolean|bigint|symbol|object|any|unknown|never|null|undefined)(?:\[\])*)*\s*$/;
+
+/** Shortest assigned value still treated as a possible credential. */
+const MIN_PASSWORD_VALUE_CHARS = 4;
+
+/** Read one assignment value without consuming a later assignment on the line. */
+function readPasswordAssignedValue(content: string, start: number): string {
+	let index = start;
+	while (/\s/.test(content[index] ?? "")) index++;
+	const first = content[index];
+	if (first === "\"" || first === "'" || first === "`") {
+		let escaped = false;
+		for (let cursor = index + 1; cursor < content.length; cursor++) {
+			const character = content[cursor];
+			if (escaped) {
+				escaped = false;
+				continue;
+			}
+			if (character === "\\") {
+				escaped = true;
+				continue;
+			}
+			if (character === first) return content.slice(index + 1, cursor);
+		}
+		return content.slice(index + 1);
+	}
+	const lineEnd = content.indexOf("\n", index);
+	const line = content.slice(index, lineEnd === -1 ? content.length : lineEnd);
+	const boundary = line.search(/[;,)}]/);
+	return boundary === -1 ? line : line.slice(0, boundary);
+}
+
+/**
+ * Decide whether an assigned password value looks like a credential rather than
+ * a TypeScript declaration. `password: string;` is a type declaration and is
+ * allowed; `password: "hunter2secret"` and `PASSWORD=hunter2secret` are refused.
+ */
+function passwordValueLooksLikeCredential(rawValue: string): boolean {
+	const value = rawValue.trim();
+	if (!value) return false;
+	if (PASSWORD_TYPE_DECLARATION_PREFIX.test(value)) return false;
+	return value.length >= MIN_PASSWORD_VALUE_CHARS;
+}
+
+/** Detect a password assignment whose value looks like a real credential. */
+function containsPasswordCredential(content: string): boolean {
+	for (const match of content.matchAll(PASSWORD_ASSIGNMENT_PATTERN)) {
+		const identifier = match[1] ?? "";
+		if (!/(?:password|passwd|pwd)/i.test(identifier)) continue;
+		const valueStart = (match.index ?? 0) + match[0].length;
+		if (passwordValueLooksLikeCredential(readPasswordAssignedValue(content, valueStart))) return true;
+	}
+	return false;
+}
 
 export interface SecretScanResult {
 	/** Safe to show to the sidecar. */
@@ -311,15 +384,15 @@ export interface SecretScanResult {
  * refuse the content entirely. Otherwise return it unchanged.
  */
 export function scanForSecrets(content: string): SecretScanResult {
+	const refusal = {
+		safe: false as const,
+		content: "",
+		refusalReason: "content matched a secret pattern; refusing to avoid leaking credentials",
+	};
 	for (const pattern of SECRET_PATTERNS) {
-		if (pattern.test(content)) {
-			return {
-				safe: false,
-				content: "",
-				refusalReason: "content matched a secret pattern; refusing to avoid leaking credentials",
-			};
-		}
+		if (pattern.test(content)) return refusal;
 	}
+	if (containsPasswordCredential(content)) return refusal;
 	return { safe: true, content };
 }
 

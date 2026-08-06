@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
-import type { Tool } from "@earendil-works/pi-ai";
+import { StringEnum, type Tool } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import {
 	isDeniedPath,
@@ -19,9 +19,44 @@ import {
 const execFileAsync = promisify(execFile);
 const MAX_FILE_BYTES = 256 * 1024;
 const MAX_LIST_ENTRIES = 100;
-const MAX_SEARCH_FILES = 64;
-const MAX_SEARCH_DEPTH = 6;
 const MAX_SEARCH_PATTERN_CHARS = 160;
+/** Upper bound on repository files examined for one search request. */
+export const MAX_SEARCH_CANDIDATES = 500;
+/** Host buffer bound for the Git candidate listing itself. */
+const MAX_CANDIDATE_LIST_BYTES = 4 * 1024 * 1024;
+/** Initial sample inspected by the binary-file guard. */
+const BINARY_SAMPLE_CHARS = 4096;
+/** Finite aggregate host buffer bound for Git diff subprocess output. */
+const MAX_DIFF_BYTES = 256 * 1024;
+/** Staged plus unstaged changes to tracked files; untracked files are excluded. */
+const GIT_DIFF_BASE_ARGS = ["diff", "HEAD", "--no-ext-diff", "--no-textconv"];
+const GIT_CACHED_DIFF_ARGS = ["diff", "--cached", "--no-ext-diff", "--no-textconv"];
+const GIT_UNSTAGED_DIFF_ARGS = ["diff", "--no-ext-diff", "--no-textconv"];
+
+/** Repository-selection variables must never redirect Git away from its cwd. */
+const GIT_SELECTION_ENV_VARS = [
+	"GIT_DIR",
+	"GIT_WORK_TREE",
+	"GIT_COMMON_DIR",
+	"GIT_INDEX_FILE",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+] as const;
+
+function sanitizedGitEnvironment(): NodeJS.ProcessEnv {
+	const environment = { ...process.env };
+	for (const variable of GIT_SELECTION_ENV_VARS) delete environment[variable];
+	return environment;
+}
+
+function gitExecutionOptions(cwd: string, maxBuffer: number) {
+	return {
+		cwd,
+		encoding: "utf8" as const,
+		maxBuffer,
+		env: sanitizedGitEnvironment(),
+	};
+}
 
 export const PITAJ_EVIDENCE_TOOL_NAME = "pitaj_request_evidence";
 
@@ -30,7 +65,10 @@ export const PITAJ_EVIDENCE_TOOL: Tool = {
 	description:
 		"Request bounded read-only evidence from the approved repository. Use one operation at a time; paths are root-relative. This tool cannot run shell commands, write files, access the network, or change models.",
 	parameters: Type.Object({
-		operation: Type.Union(ORACLE_EVIDENCE_OPERATIONS.map((operation) => Type.Literal(operation))),
+		operation: StringEnum(ORACLE_EVIDENCE_OPERATIONS, {
+			description:
+				"The single bounded evidence operation to run. git_diff reports staged plus unstaged changes to tracked files only; use search or read_file for untracked files.",
+		}),
 		path: Type.Optional(
 			Type.String({
 				description: "Optional root-relative directory for search/list_files, required root-relative file path for read_file.",
@@ -95,7 +133,18 @@ function pathIsInside(root: string, candidate: string): boolean {
 	return pathRelative !== "" && !pathRelative.startsWith(`..${sep}`) && pathRelative !== "..";
 }
 
-async function assertStablePath(root: string, candidate: string): Promise<void> {
+function isMissingPathError(error: unknown): boolean {
+	if (!error || typeof error !== "object") return false;
+	const code = (error as { code?: unknown }).code;
+	return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/**
+ * Validate every existing path component. Git diffs may name a path that was
+ * staged and then deleted, so callers that explicitly allow absent paths get a
+ * clean result after all existing ancestors have still passed this check.
+ */
+async function assertStablePath(root: string, candidate: string, allowMissingPath = false): Promise<void> {
 	if (!pathIsInside(root, candidate)) throw new Error("path is outside the approved root");
 	const relativePath = relative(root, candidate);
 	if (isDeniedPath(relativePath)) throw new Error("path is denied by the sensitive-material policy");
@@ -105,12 +154,22 @@ async function assertStablePath(root: string, candidate: string): Promise<void> 
 		if (!segment) continue;
 		if (isDeniedSegment(segment)) throw new Error("path is denied by the sensitive-material policy");
 		current = resolve(current, segment);
-		const metadata = await lstat(current);
-		if (metadata.isSymbolicLink()) throw new Error("symbolic links are not allowed for evidence paths");
+		try {
+			const metadata = await lstat(current);
+			if (metadata.isSymbolicLink()) throw new Error("symbolic links are not allowed for evidence paths");
+		} catch (error) {
+			if (allowMissingPath && isMissingPathError(error)) return;
+			throw error;
+		}
 	}
 
-	const canonical = await realpath(candidate);
-	if (!pathIsInside(root, canonical)) throw new Error("path resolves outside the approved root");
+	try {
+		const canonical = await realpath(candidate);
+		if (!pathIsInside(root, canonical)) throw new Error("path resolves outside the approved root");
+	} catch (error) {
+		if (allowMissingPath && isMissingPathError(error)) return;
+		throw error;
+	}
 }
 
 async function resolveEvidencePath(root: ApprovedOracleRoot, requestedPath: string, allowRoot: boolean): Promise<string> {
@@ -170,30 +229,36 @@ async function listFiles(root: ApprovedOracleRoot, requestedPath: string | undef
 	return safeContent(lines.join("\n") || "(no approved entries)", maxChars);
 }
 
-async function collectSearchFiles(root: ApprovedOracleRoot, directory: string): Promise<string[]> {
-	const files: string[] = [];
-	const visit = async (current: string, depth: number): Promise<void> => {
-		if (files.length >= MAX_SEARCH_FILES || depth > MAX_SEARCH_DEPTH) return;
-		const entries = await readdir(current, { withFileTypes: true });
-		for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-			if (files.length >= MAX_SEARCH_FILES) return;
-			if (isDeniedSegment(entry.name)) continue;
-			const candidate = resolve(current, entry.name);
-			try {
-				await assertStablePath(root.path, candidate);
-				const metadata = await lstat(candidate);
-				if (metadata.isDirectory()) {
-					await visit(candidate, depth + 1);
-				} else if (metadata.isFile() && !metadata.isSymbolicLink()) {
-					files.push(candidate);
-				}
-			} catch {
-				// Skip unsafe or unreadable nested paths without identifying them.
-			}
-		}
+interface SearchCandidates {
+	readonly relativePaths: string[];
+	/** More repository files existed than the host candidate bound allows. */
+	readonly truncated: boolean;
+}
+
+/**
+ * Enumerate search candidates through Git: tracked plus non-ignored untracked
+ * files, optionally narrowed to a root-relative directory. Ignored dependency
+ * and build trees never become candidates. Throws when Git cannot enumerate.
+ */
+async function collectSearchCandidates(root: ApprovedOracleRoot, directory: string): Promise<SearchCandidates> {
+	const relativeDirectory = relative(root.path, directory);
+	const response = await execFileAsync(
+		"git",
+		// `:(literal)` keeps a directory name from being read as pathspec magic.
+		["ls-files", "-co", "--exclude-standard", "-z", ...(relativeDirectory ? ["--", `:(literal)${relativeDirectory}`] : [])],
+		gitExecutionOptions(root.path, MAX_CANDIDATE_LIST_BYTES),
+	);
+	const listed = typeof response.stdout === "string" ? response.stdout : String(response.stdout);
+	const unique = [...new Set(listed.split("\0").filter(Boolean))].sort((left, right) => left.localeCompare(right));
+	return {
+		relativePaths: unique.slice(0, MAX_SEARCH_CANDIDATES),
+		truncated: unique.length > MAX_SEARCH_CANDIDATES,
 	};
-	await visit(directory, 0);
-	return files;
+}
+
+/** Bounded binary guard: a NUL byte in the initial sample means non-text. */
+function looksBinary(text: string): boolean {
+	return text.slice(0, BINARY_SAMPLE_CHARS).includes("\u0000");
 }
 
 async function searchFiles(
@@ -208,23 +273,54 @@ async function searchFiles(
 	const directory = await resolveEvidencePath(root, requestedPath ?? ".", true);
 	const metadata = await lstat(directory);
 	if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("requested path is not a directory");
+
+	let candidates: SearchCandidates;
+	try {
+		candidates = await collectSearchCandidates(root, directory);
+	} catch {
+		return genericRefusal("search could not enumerate repository files");
+	}
+
 	const matches: string[] = [];
-	for (const file of await collectSearchFiles(root, directory)) {
-		if (matches.length >= MAX_LIST_ENTRIES) break;
+	let matchLimitReached = false;
+	let skippedCandidates = 0;
+	for (const candidatePath of candidates.relativePaths) {
+		if (matchLimitReached) break;
 		try {
-			const { text, relativePath } = await readRegularFile(root, relative(root.path, file));
+			const { text, relativePath } = await readRegularFile(root, candidatePath);
+			if (looksBinary(text)) {
+				skippedCandidates++;
+				continue;
+			}
 			for (const [index, line] of text.split("\n").entries()) {
-				if (line.includes(query)) {
-					matches.push(`${relativePath}:${index + 1}: ${line}`);
-					if (matches.length >= MAX_LIST_ENTRIES) break;
+				if (!line.includes(query)) continue;
+				matches.push(`${relativePath}:${index + 1}: ${line}`);
+				if (matches.length >= MAX_LIST_ENTRIES) {
+					matchLimitReached = true;
+					break;
 				}
 			}
 		} catch {
-			// A file can change after enumeration; ignore it rather than leak host details.
+			// A candidate can be denied, unsafe, oversized, or changed after
+			// enumeration; count it without disclosing its path or the cause.
+			skippedCandidates++;
 		}
 	}
-	if (matches.length >= MAX_LIST_ENTRIES) matches.push("[pitaj oracle: search match limit reached]");
-	return safeContent(matches.join("\n") || "(no approved matches)", maxChars);
+
+	const notes: string[] = [];
+	if (candidates.truncated) {
+		notes.push(`[pitaj oracle: candidate limit reached; searched the first ${MAX_SEARCH_CANDIDATES} repository files]`);
+	}
+	if (skippedCandidates > 0) {
+		notes.push(`[pitaj oracle: search was partial; skipped ${skippedCandidates} candidates without disclosing paths or causes]`);
+	}
+	if (matchLimitReached) notes.push("[pitaj oracle: search match limit reached]");
+	const body = matches.length > 0
+		? matches.join("\n")
+		: candidates.truncated
+			? `(no approved matches in the first ${MAX_SEARCH_CANDIDATES} repository files)`
+			: "(no approved matches)";
+	return safeContent([...notes, body].join("\n"), maxChars);
 }
 
 interface GitChangedPath {
@@ -275,58 +371,162 @@ async function assertApprovedRoot(root: ApprovedOracleRoot): Promise<void> {
 	}
 }
 
-async function gitDiff(root: ApprovedOracleRoot, maxChars: number): Promise<OracleAdapterResult> {
-	// Inspect changed paths via --name-status -z before fetching content.
-	// NUL-separated tokens handle paths with spaces; -z disables quoting.
-	const statusResponse = await execFileAsync(
-		"git",
-		["diff", "--name-status", "-z", "--no-ext-diff", "--no-textconv"],
-		{ cwd: root.path, encoding: "utf8", maxBuffer: MAX_FILE_BYTES },
-	);
-	const statusOutput = typeof statusResponse.stdout === "string" ? statusResponse.stdout : String(statusResponse.stdout);
-	for (const changed of parseGitNameStatus(statusOutput)) {
+/** Marker error for a Git subprocess whose output passed the host buffer bound. */
+class OversizedGitOutputError extends Error {}
+
+/** Whether a failed subprocess exceeded its configured `maxBuffer`. */
+function isMaxBufferFailure(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const code = (error as { code?: unknown }).code;
+	return code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" || code === "ENOBUFS" || /maxBuffer/i.test(error.message);
+}
+
+/** Run one bounded Git command and account for its output against the diff budget. */
+async function runBoundedGit(root: ApprovedOracleRoot, args: string[], budget?: GitOutputBudget): Promise<string> {
+	const maxBuffer = budget?.remaining ?? MAX_DIFF_BYTES;
+	if (maxBuffer <= 0) throw new OversizedGitOutputError("git output exceeded the host buffer limit");
+	try {
+		const response = await execFileAsync("git", args, gitExecutionOptions(root.path, maxBuffer));
+		const stdout = typeof response.stdout === "string" ? response.stdout : String(response.stdout);
+		const stderr = typeof response.stderr === "string" ? response.stderr : String(response.stderr);
+		budget?.consume(stdout, stderr);
+		return stdout;
+	} catch (error) {
+		if (isMaxBufferFailure(error)) throw new OversizedGitOutputError("git output exceeded the host buffer limit");
+		throw error;
+	}
+}
+
+/** Finite aggregate accounting for all Git output used to construct one diff. */
+class GitOutputBudget {
+	private usedBytes = 0;
+
+	get remaining(): number {
+		return Math.max(0, MAX_DIFF_BYTES - this.usedBytes);
+	}
+
+	consume(stdout: string, stderr: string): void {
+		this.usedBytes += Buffer.byteLength(stdout, "utf8") + Buffer.byteLength(stderr, "utf8");
+		if (this.usedBytes > MAX_DIFF_BYTES) throw new OversizedGitOutputError("git output exceeded the host buffer limit");
+	}
+}
+
+function isMissingHeadFailure(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const code = (error as { code?: unknown }).code;
+	return code === 1 || code === "1";
+}
+
+/** Check whether the approved repository has a resolvable commit named HEAD. */
+async function repositoryHasHead(root: ApprovedOracleRoot, budget: GitOutputBudget): Promise<boolean> {
+	try {
+		return Boolean((await runBoundedGit(root, ["rev-parse", "--verify", "--quiet", "HEAD"], budget)).trim());
+	} catch (error) {
+		// `rev-parse --verify --quiet HEAD` exits 1, without stderr, for a valid
+		// repository whose current branch has no initial commit.
+		if (isMissingHeadFailure(error)) return false;
+		throw error;
+	}
+}
+/** Preflight every changed path without exposing content before validation. */
+async function validateChangedPathsAsync(root: ApprovedOracleRoot, statuses: readonly string[]): Promise<OracleAdapterResult | undefined> {
+	const seen = new Set<string>();
+	for (const changed of statuses.flatMap(parseGitNameStatus)) {
+		const identity = `${changed.exists ? "exists" : "deleted"}\0${changed.path}`;
+		if (seen.has(identity)) continue;
+		seen.add(identity);
 		// Lexical deny check — applies to deleted paths too.
 		if (isDeniedPath(changed.path)) return genericRefusal("diff includes a denied sensitive path");
 		// Lexical root/traversal check.
 		const resolved = resolveRootRelativePath(root.path, changed.path);
 		if (!resolved.ok) return genericRefusal("diff includes an unsafe path");
-		// For paths that still exist on disk, apply the same symlink/realpath
-		// policy as read_file. Deleted paths skip this (the file is gone) but
-		// have already passed the lexical checks above.
-		if (changed.exists) {
-			try {
-				await assertStablePath(root.path, resolved.resolved);
-			} catch {
-				return genericRefusal("diff includes an unsafe path");
-			}
+		// The helper checks current filesystem state, not the status letter:
+		// existing paths receive full symlink/realpath validation, while an absent
+		// staged or deleted path is allowed after lexical checks above.
+		try {
+			await assertStablePath(root.path, resolved.resolved, true);
+		} catch {
+			return genericRefusal("diff includes an unsafe path");
 		}
 	}
-
-	const diffResponse = await execFileAsync(
-		"git",
-		["diff", "--no-ext-diff", "--no-textconv", "--unified=3"],
-		{ cwd: root.path, encoding: "utf8", maxBuffer: MAX_FILE_BYTES },
-	);
-	const output = typeof diffResponse.stdout === "string" ? diffResponse.stdout : String(diffResponse.stdout);
-	return safeContent(output || "(no working-tree diff)", maxChars);
+	return undefined;
 }
 
-export async function approveOracleRoot(requestedRoot: string): Promise<ApprovedOracleRoot> {
+/**
+ * Return staged plus unstaged changes to tracked files. Committed repositories
+ * use `git diff HEAD`; an unborn repository combines its cached and unstaged
+ * tracked diffs because HEAD does not exist yet. Untracked files are excluded.
+ * Every changed path is preflighted before content is returned, and all Git
+ * output shares one finite host buffer.
+ */
+async function gitDiff(root: ApprovedOracleRoot, maxChars: number): Promise<OracleAdapterResult> {
 	try {
-		const canonicalRoot = await realpath(requestedRoot.trim());
+		const budget = new GitOutputBudget();
+		const statuses: string[] = [];
+		const contents: string[] = [];
+		const hasHead = await repositoryHasHead(root, budget);
+		if (hasHead) {
+			statuses.push(await runBoundedGit(root, [...GIT_DIFF_BASE_ARGS, "--name-status", "-z"], budget));
+		} else {
+			statuses.push(await runBoundedGit(root, [...GIT_CACHED_DIFF_ARGS, "--name-status", "-z"], budget));
+			statuses.push(await runBoundedGit(root, [...GIT_UNSTAGED_DIFF_ARGS, "--name-status", "-z"], budget));
+		}
+
+		const refusal = await validateChangedPathsAsync(root, statuses);
+		if (refusal) return refusal;
+
+		if (hasHead) {
+			contents.push(await runBoundedGit(root, [...GIT_DIFF_BASE_ARGS, "--unified=3"], budget));
+		} else {
+			contents.push(await runBoundedGit(root, [...GIT_CACHED_DIFF_ARGS, "--unified=3"], budget));
+			contents.push(await runBoundedGit(root, [...GIT_UNSTAGED_DIFF_ARGS, "--unified=3"], budget));
+		}
+		const output = contents.filter(Boolean).join("\n");
+		return safeContent(output || "(no staged or unstaged changes to tracked files)", maxChars);
+	} catch (error) {
+		if (error instanceof OversizedGitOutputError) {
+			return genericRefusal("diff output exceeds the host buffer limit; narrow the request with read_file or search");
+		}
+		throw error;
+	}
+}
+
+/** Canonical Git top-level directory containing `directory`. */
+async function canonicalGitTopLevel(directory: string): Promise<string> {
+	const canonicalDirectory = await realpath(directory.trim());
+	const response = await execFileAsync("git", ["rev-parse", "--show-toplevel"], gitExecutionOptions(canonicalDirectory, 16 * 1024));
+	return await realpath(String(response.stdout).trim());
+}
+
+/**
+ * Approve a model-supplied `oracleRoot` for bounded read-only evidence.
+ *
+ * The root must be an existing canonical Git repository root and must equal the
+ * Git top-level of the active Pi workspace (`workspaceCwd`). A different valid
+ * Git repository is refused: Oracle evidence never leaves the active workspace.
+ */
+export async function approveOracleRoot(requestedRoot: string, workspaceCwd: string): Promise<ApprovedOracleRoot> {
+	let canonicalRoot: string;
+	try {
+		canonicalRoot = await realpath(requestedRoot.trim());
 		const metadata = await lstat(canonicalRoot);
 		if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("not a directory");
-		const response = await execFileAsync("git", ["rev-parse", "--show-toplevel"], {
-			cwd: canonicalRoot,
-			encoding: "utf8",
-			maxBuffer: 16 * 1024,
-		});
-		const gitRoot = await realpath(String(response.stdout).trim());
+		const gitRoot = await canonicalGitTopLevel(canonicalRoot);
 		if (gitRoot !== canonicalRoot) throw new Error("not the repository root");
-		return { path: canonicalRoot };
 	} catch {
 		throw new Error("Oracle mode requires oracleRoot to be an existing repository root.");
 	}
+
+	let workspaceRoot: string;
+	try {
+		workspaceRoot = await canonicalGitTopLevel(workspaceCwd);
+	} catch {
+		throw new Error("Oracle mode requires the active workspace to be inside a Git repository.");
+	}
+	if (workspaceRoot !== canonicalRoot) {
+		throw new Error("Oracle mode requires oracleRoot to equal the active workspace repository root.");
+	}
+	return { path: canonicalRoot };
 }
 
 export async function executeOracleEvidence(
