@@ -1,6 +1,6 @@
 # pi-pitaj correctness hardening specification
 
-**Status:** Planned Crew M3 candidate after whole-repository review on 2026-08-06
+**Status:** Shipped as Crew M3 on 2026-08-07 (`14316b8`, `e7541ae`, `fad8e49`, `b00b700`) — retained as implementation history
 **Scope:** Correctness, privacy boundaries, Oracle evidence usefulness, accounting, and repository hygiene
 **Non-goal:** Reopen retired full active-conversation forwarding
 
