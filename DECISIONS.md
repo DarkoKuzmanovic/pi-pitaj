@@ -36,11 +36,11 @@ Settings remain manually editable JSON. Interactive writes validate before persi
 
 ## 2026-07-11 — Oracle exposes only bounded host-mediated evidence
 
-**Status:** accepted; hardening planned
+**Status:** accepted; hardened in v0.3.0
 
 Oracle mode exposes only `read_file`, `search`, `list_files`, and `git_diff`. Operations are read-only, root-relative, host-mediated, path-checked, secret-scanned, and bounded by request, per-result, and aggregate limits. The sidecar cannot run arbitrary commands, write files, select a new root/model, invoke Pi tools, or execute requested host actions automatically.
 
-The stable-checkout assumption and sensitive-path policy are security invariants. Known correctness and root-scope gaps are specified in `docs/specs/correctness-hardening.md`.
+The stable-checkout assumption and sensitive-path policy are security invariants. The correctness and root-scope hardening defined in `docs/specs/correctness-hardening.md` shipped in v0.3.0; future changes to root scope, evidence disclosure, or secret handling remain protected-risk work.
 
 ## 2026-08-06 — Retire full active-conversation forwarding
 
@@ -56,4 +56,4 @@ Reconsider only for a concrete workflow that cannot be served by those two bound
 
 Crew is the sole planning workflow for future work. Root `ROADMAP.md` is strategic, root `PLAN.md` exists only while a build is active, root `DECISIONS.md` owns durable rationale, and `todo_write` mirrors only the current wave. Status is derived rather than duplicated across task packets, session logs, and state directories.
 
-The legacy PMTI M0–M5 identifiers are not reused as Crew milestones. Crew restarts numbering around shipped releases: M0 foundation, M1 targeted hardening, and M2 Oracle-lite. PMTI’s process decisions about current-branch execution, task packets, and execution lanes are superseded by Crew’s branch-first, tiered, risk-dominant workflow.
+The legacy PMTI M0–M5 identifiers—including the never-built M5 full-branch milestone—are not reused as Crew milestones. Crew restarts numbering around shipped releases: M0 foundation, M1 targeted hardening, and M2 Oracle-lite. PMTI’s process decisions about current-branch execution, task packets, and execution lanes are superseded by Crew’s branch-first, tiered, risk-dominant workflow.

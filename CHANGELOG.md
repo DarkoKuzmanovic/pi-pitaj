@@ -5,14 +5,17 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-07
+
 ### Changed
 
 - Raised Oracle mode's hard evidence budget from 3 to 9 requests and from 12,000 to 18,000 aggregate characters per consultation. The 4,000-character per-result cap and all read-only/root/sensitive-path protections remain unchanged; the first reached limit still stops further evidence requests.
-- Hardened Oracle around the active workspace: `oracleRoot` must match its canonical Git root; read-only evidence uses bounded Git-listed search and tracked diffs with traversal, symlink, sensitive-path, and content protections.
+- Constrained Oracle to the active Pi workspace: `oracleRoot` must equal that workspace's canonical Git top-level, and a different valid repository is rejected before any provider request. Start Pi in the target repository for cross-project review.
+- Made Oracle evidence more interoperable and useful: Google-compatible string enums, staged plus unstaged tracked diffs with explicit oversized-output refusal, and secret scanning that permits type declarations such as `password: string;` while retaining credential-value protections.
 - Kept Oracle explicit per-call: persisted or default `oracle` mode is rejected safely with a fallback warning. Exact context/output caps include their markers, and quote-aware `/pitaj auto --risk` parsing consumes only top-level flags.
 - Aggregated nested provider usage once per completed stream round and made evidence exhaustion graceful with one bounded refusal followed by one tools-disabled final round and truthful exhaustion metadata.
 - Made snapshot metadata structural after final context bounding and kept failure metadata truthful to effective consultation facts without charging failed consults to advisory budgets.
-- Restored repeatable package gates: unchanged `npm test`, strict shared-toolchain `typecheck`, typecheck-then-test `check`, and `package-lock.json` root metadata aligned with package version `0.2.0`.
+- Restored repeatable package gates: unchanged `npm test`, strict shared-toolchain `typecheck`, typecheck-then-test `check`, and matching package/lockfile release metadata.
 
 ## [0.2.0] — 2026-07-11
 
@@ -47,10 +50,10 @@ All notable changes to this project are documented here. Format loosely follows
 
 ### Changed
 
-- `roadmap.md` now lists M4 as completed instead of a candidate milestone.
+- The removed PMTI `.pi/pmti/project/roadmap.md` still listed legacy M4 as a candidate after it shipped; it was moved to completed.
 - `README.md`'s Files/Testing sections now list all 5 test files (was still describing a single `helpers.test.ts`) and the previously-undocumented `usage.ts`.
 
-All three issues were found by a full-extension Claude Fable production-truth review and independently verified against source, including a manual `tsc --noEmit --strict` run confirming the flagged type errors as real (this repo still has no typecheck gate in CI).
+At that release, all three issues were found by a full-extension Claude Fable production-truth review and independently verified against source, including a manual `tsc --noEmit --strict` run confirming the flagged type errors as real; the repository did not yet have a repeatable typecheck gate.
 
 ## [0.1.0] — 2026-05-30 to 2026-07-08
 

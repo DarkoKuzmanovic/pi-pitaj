@@ -4,6 +4,36 @@ A tiny [Pi](https://github.com/earendil-works/pi-coding-agent) extension for in-
 
 Changes are tracked in [CHANGELOG.md](CHANGELOG.md).
 
+## Contents
+
+- [What it does](#what-it-does)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Snapshot consults](#snapshot-consults)
+- [Tool usage](#tool-usage)
+  - [Auto-routed call](#auto-routed-call)
+  - [Explicit model calls](#explicit-model-calls)
+  - [Oracle call](#oracle-call)
+  - [Auto command](#auto-command)
+  - [Advise command](#advise-command)
+- [Config command](#config-command)
+  - [Parameters](#parameters)
+- [Oracle mode](#oracle-mode)
+  - [Evidence tool operations](#evidence-tool-operations)
+  - [What Oracle mode cannot do](#what-oracle-mode-cannot-do)
+  - [Host-action continuation](#host-action-continuation)
+  - [Stable-checkout threat model](#stable-checkout-threat-model)
+  - [Failure behavior](#failure-behavior)
+- [Settings](#settings)
+  - [Usage summary](#usage-summary)
+  - [Advisory budget warnings](#advisory-budget-warnings)
+  - [Sidecar model limitations](#sidecar-model-limitations)
+  - [Result block format](#result-block-format)
+- [Testing](#testing)
+- [Files](#files)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
 ## What it does
 
 `pi-pitaj` adds:
@@ -18,14 +48,14 @@ It supports aliases, bounded context + output size, built-in response modes, nes
 From Pi, install this extension from GitHub:
 
 ```bash
-# Exact 0.2.0 release (recommended for reproducible installs)
-pi install git:github.com/DarkoKuzmanovic/pi-pitaj@v0.2.0
+# Exact 0.3.0 release (recommended for reproducible installs)
+pi install git:github.com/DarkoKuzmanovic/pi-pitaj@v0.3.0
 
 # Or follow the default branch (main) for the latest unreleased state
 pi install git:github.com/DarkoKuzmanovic/pi-pitaj
 
-# Rollback to the 0.1.1 baseline
-pi install git:github.com/DarkoKuzmanovic/pi-pitaj@v0.1.1
+# Rollback to the 0.2.0 Oracle baseline
+pi install git:github.com/DarkoKuzmanovic/pi-pitaj@v0.2.0
 ```
 
 `git:` installs with no `@ref` follow the repository's default branch (`main`). Use an `@v...` tag when you want a pinned, reviewed release.
@@ -182,7 +212,7 @@ Alias editing is manual in M2: edit `settings.json` directly, then run `/pitaj c
 ### Parameters
 
 - `question` **required**
-- `model` optional: a configured alias (`opus`, `opus47`, `fable`, `terra`, `sol`, `deepseek`, `glm`, `spark`, `mm`), explicit `provider/model`, or `auto` for built-in routing.
+- `model` optional: a configured alias (`opus`, `opus47`, `fable`, `terra`, `sol`, `deepseek`, `gpt`, `glm`, `spark`, `mm`), explicit `provider/model`, or `auto` for built-in routing.
 - `risk` optional: `low` or `high`. Only used when `model` is `auto`. `low` = bounded technical question; `high` = architecture, security, data integrity, or hard-to-reverse decision.
 - `mode`: `answer` | `critique` | `debug` | `plan` | `risk-check` | `oracle`; `oracle` is explicit per-call only
 - `context` optional bounded supporting context. In ordinary modes pitaj is a sidecar consult without tools — it cannot inspect files unless you provide context.
@@ -300,7 +330,7 @@ routes:
   snapshot: 1
 
 models:
-  gpt (openai/gpt-5.1): 3
+  gpt (openai-codex/gpt-5.5): 3
   opus (anthropic/claude-opus-4-8): 2
 
 context source:
@@ -354,7 +384,7 @@ Consult results are presented answer-first, with compact metadata after a divide
 Your answer here.
 
 ---
-model: openai/gpt-5.1 (gpt)
+model: openai-codex/gpt-5.5 (gpt)
 route: mode=answer · brevity=short · auto-routed · reason=auto: default → gpt
 context: none
 sidecar: no tools / no file access (no context provided)
@@ -398,7 +428,7 @@ npm run check
 
 ## Troubleshooting
 
-- If `/pitaj` asks for a model and your alias is unknown, use a configured alias such as `opus`, `opus47`, `fable`, `terra`, `sol`, `deepseek`, `glm`, `spark`, or `mm`, or pass a full `provider/model` reference.
+- If `/pitaj` asks for a model and your alias is unknown, use a configured alias such as `opus`, `opus47`, `fable`, `terra`, `sol`, `deepseek`, `gpt`, `glm`, `spark`, or `mm`, or pass a full `provider/model` reference.
 - On parse/config issues, run `/pitaj config show`; if `settings.json` is malformed, fix it manually because `/pitaj config` refuses to overwrite malformed files.
 - If a model lookup fails, check model registration in Pi model configuration.
 - If `/pitaj snapshot` has too little context, remember that active-plan and risk categories are omitted unless explicitly supplied, and recent tool results only appear after the bounded ring buffer has captured tool completions.

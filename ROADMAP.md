@@ -9,7 +9,7 @@ Crew milestone numbers are release-oriented. Legacy PMTI identifiers remain in t
 - **M0** — Focused consultation foundation: auto-routing, curated snapshots, safe config, usage observability, and convenience commands — v0.1.0 (2026-07-08)
 - **M1** — Targeted correctness and documentation hardening — v0.1.1 (2026-07-09)
 - **M2** — Bounded Oracle evidence mode — v0.2.0 (2026-07-11)
-- **M3** — Correctness, privacy-boundary, accounting, and Oracle evidence hardening — shipped locally (2026-08-07)
+- **M3** — Correctness, privacy-boundary, accounting, and Oracle evidence hardening — v0.3.0 (2026-08-07)
 
 ## Planned
 

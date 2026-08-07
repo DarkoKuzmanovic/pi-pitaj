@@ -1,6 +1,6 @@
 # pi-pitaj correctness hardening specification
 
-**Status:** Shipped as Crew M3 on 2026-08-07 (`14316b8`, `e7541ae`, `fad8e49`, `b00b700`) — retained as implementation history
+**Status:** Shipped in v0.3.0 as Crew M3 on 2026-08-07 (`14316b8`, `e7541ae`, `fad8e49`, `b00b700`) — retained as implementation history
 **Scope:** Correctness, privacy boundaries, Oracle evidence usefulness, accounting, and repository hygiene
 **Non-goal:** Reopen retired full active-conversation forwarding
 
@@ -245,7 +245,7 @@ Fresh baseline evidence:
 
 **Files:** `package.json`, `package-lock.json`, new `tsconfig.json` if needed, `README.md` or contributor docs if commands are documented
 
-- Regenerate the lockfile so its root package version matches `package.json` (`0.2.0`).
+- Regenerate the lockfile so its root package version matches `package.json` (`0.2.0` during implementation; both bumped together to `0.3.0` for release).
 - Add `typecheck` and `check` scripts using the shared Pi development toolchain; do not add local compiler dependencies unless required.
 - Keep `npm test` unchanged as the focused test command.
 

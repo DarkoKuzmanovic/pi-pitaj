@@ -1,7 +1,7 @@
 # Oracle Evidence Budget Increase
 
 **Date:** 2026-07-26
-**Status:** Approved design
+**Status:** Shipped in v0.3.0 on 2026-08-07 — retained as design history
 
 ## Goal
 
