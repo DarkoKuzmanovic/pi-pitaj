@@ -87,11 +87,17 @@ Oracle mode requires an explicit `oracleRoot` that equals the canonical Git top-
 
 ## Testing
 
-Run:
+Run focused tests or the repeatable verification gate:
 
 ```bash
 npm test
+npm run typecheck
+npm run check
 ```
+
+- `npm test` runs the focused Node test suite.
+- `npm run typecheck` checks every root product and test `.ts` file with the strict NodeNext, no-emit configuration in `tsconfig.json`.
+- `npm run check` runs typecheck first, then the focused test suite.
 
 Tests cover parsing/routing, settings writes, prompt and result shaping, consultation stream behavior, snapshots, usage accounting, and Oracle policy/adapter/tool-loop boundaries.
 
@@ -115,6 +121,10 @@ For snapshot/context builders, final whole-context truncation can invalidate per
 ### Validate raw user input before fallback helpers
 
 When a helper intentionally falls back from blank input to defaults, do not use that helper as proof that raw user input is valid for persistence. Validate the submitted value first, then call fallback-aware resolution only after the input has passed the stricter boundary check.
+
+### Preserve lexical provenance until syntax is consumed
+
+When parsing command text, do not flatten quote-aware tokens into plain strings before deciding which tokens are syntax. Carry metadata such as `quoted` through flag extraction so a quoted literal like `"--risk"` cannot be mistaken for a top-level option; flatten only after syntax-consuming stages are complete.
 
 ## Crew project state
 

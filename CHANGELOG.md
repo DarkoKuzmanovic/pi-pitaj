@@ -8,6 +8,11 @@ All notable changes to this project are documented here. Format loosely follows
 ### Changed
 
 - Raised Oracle mode's hard evidence budget from 3 to 9 requests and from 12,000 to 18,000 aggregate characters per consultation. The 4,000-character per-result cap and all read-only/root/sensitive-path protections remain unchanged; the first reached limit still stops further evidence requests.
+- Hardened Oracle around the active workspace: `oracleRoot` must match its canonical Git root; read-only evidence uses bounded Git-listed search and tracked diffs with traversal, symlink, sensitive-path, and content protections.
+- Kept Oracle explicit per-call: persisted or default `oracle` mode is rejected safely with a fallback warning. Exact context/output caps include their markers, and quote-aware `/pitaj auto --risk` parsing consumes only top-level flags.
+- Aggregated nested provider usage once per completed stream round and made evidence exhaustion graceful with one bounded refusal followed by one tools-disabled final round and truthful exhaustion metadata.
+- Made snapshot metadata structural after final context bounding and kept failure metadata truthful to effective consultation facts without charging failed consults to advisory budgets.
+- Restored repeatable package gates: unchanged `npm test`, strict shared-toolchain `typecheck`, typecheck-then-test `check`, and `package-lock.json` root metadata aligned with package version `0.2.0`.
 
 ## [0.2.0] — 2026-07-11
 

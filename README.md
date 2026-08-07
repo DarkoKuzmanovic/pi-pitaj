@@ -364,10 +364,17 @@ When advisory thresholds are reached, `warning: ...` lines are appended after th
 
 ## Testing
 
+The repeatable verification commands are:
+
 ```bash
 npm test
+npm run typecheck
+npm run check
 ```
 
+- `npm test` runs the focused Node test suite for the extension.
+- `npm run typecheck` runs the shared TypeScript compiler against every root product and test `.ts` file under the strict NodeNext, no-emit configuration in `tsconfig.json`.
+- `npm run check` runs `npm run typecheck` first, then `npm test`.
 - Unit tests cover model alias resolution and auto-routing, command/flag parsing, prompt shaping, Oracle policy/host evidence/serial tool-loop behavior, snapshot context building and runtime capture, snapshot command wiring, config settings semantics and updates, consult stopReason/error-handling integrity, and usage/budget accounting.
 
 ## Files
@@ -379,6 +386,7 @@ npm test
 - `snapshot.ts` — pure snapshot contract and context builder.
 - `snapshot-runtime.ts` — bounded runtime snapshot collection seam and tool-result ring buffer.
 - `usage.ts` — usage-event recorder wrapping the in-memory usage store; `index.ts` owns one instance per extension setup.
+- `tsconfig.json` — strict NodeNext, no-emit TypeScript configuration for the typecheck gate.
 - `settings.json` — default model/mode/alias configuration.
 - `helpers.test.ts` — prompt shaping, command/config classification, advise flag violations, snapshot contract/runtime/wiring, brevity scaling, and M3 result-block/usage-accounting tests.
 - `settings.test.ts` — settings parsing, model aliases, M2 config contract, config summary/validation, and interactive config-update tests.
