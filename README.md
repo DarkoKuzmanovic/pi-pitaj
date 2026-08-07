@@ -11,7 +11,7 @@ Changes are tracked in [CHANGELOG.md](CHANGELOG.md).
 - `pitaj` tool: call another configured model from an existing Pi flow.
 - `/pitaj` command: ask a model directly from chat using a compact prompt.
 
-It supports aliases, bounded context + output size, built-in response modes, in-session usage tracking, and advisory budget warnings so you can stay aware of how many consults you have sent.
+It supports aliases, bounded context + output size, built-in response modes, nested-model usage accounting, in-session usage tracking, and advisory budget warnings so you can stay aware of how many consults you have sent.
 
 ## Installation
 
@@ -137,6 +137,8 @@ Use `/pitaj auto` to route through the built-in auto-router instead of specifyin
 
 Auto-routing dispatches based on the `--risk` hint (or the `/pitaj` `risk` field): low risk → GPT-style model; high risk → Opus-style model. When risk is omitted and mode is `risk-check`, it routes to Opus; otherwise defaults to GPT.
 
+The `--risk` flag is parsed quote-aware. Only top-level `--risk low|high` flags are consumed for routing; quoted or literal text in the question or context is preserved. Duplicate, missing, or invalid risk flags are rejected.
+
 The `auto` subcommand name is reserved and cannot be used as a settings alias.
 
 ### Advise command
@@ -167,6 +169,8 @@ Supported guided fields:
 - `maxContextChars`
 - `maxOutputChars`
 
+`defaultMode` accepts only `answer`, `critique`, `debug`, `plan`, or `risk-check`. Oracle remains an explicit per-call mode. A persisted `defaultMode` of `oracle` or another invalid value falls back to `answer` and emits a warning.
+
 Write safety rules:
 
 - Missing `settings.json`: `/pitaj config` may create it after validation and confirmation.
@@ -180,15 +184,17 @@ Alias editing is manual in M2: edit `settings.json` directly, then run `/pitaj c
 - `question` **required**
 - `model` optional: a configured alias (`opus`, `opus47`, `fable`, `terra`, `sol`, `deepseek`, `glm`, `spark`, `mm`), explicit `provider/model`, or `auto` for built-in routing.
 - `risk` optional: `low` or `high`. Only used when `model` is `auto`. `low` = bounded technical question; `high` = architecture, security, data integrity, or hard-to-reverse decision.
-- `mode`: `answer` | `critique` | `debug` | `plan` | `risk-check` | `oracle`
+- `mode`: `answer` | `critique` | `debug` | `plan` | `risk-check` | `oracle`; `oracle` is explicit per-call only
 - `context` optional bounded supporting context. In ordinary modes pitaj is a sidecar consult without tools — it cannot inspect files unless you provide context.
 - `brevity`: `short` | `normal` | `detailed`
-- `maxContextChars` optional max chars sent from context
-- `maxOutputChars` optional max chars returned
+- `maxContextChars` optional exact cap for context characters sent; truncation markers count toward the cap
+- `maxOutputChars` optional exact cap for answer characters returned; truncation and provider-warning markers count toward the cap
 - `oracleRoot` required when `mode` is `oracle`: exact path to a Git repository root. It must equal the canonical Git top-level of the active Pi workspace (the repository containing the session's working directory). A different repository is rejected before any model request, and there is no cwd fallback.
 - `maxEvidenceRequests` optional when `mode` is `oracle`: override the evidence-request cap with a whole number (1..9; default 9). A fractional or non-finite value is rejected rather than expanded.
 
-Budget defaults are hard caps enforced by the host adapter: 9 evidence requests per consultation, 4,000 characters per result, 18,000 characters total. The first reached limit stops further evidence requests.
+Provider usage is separate from `/pitaj usage`'s coarse in-session counters. When available, the registered tool's top-level `usage` reports nested-model usage aggregated once per completed stream round, including Oracle tool rounds; missing or zero-usage rounds are not fabricated.
+
+Budget defaults are hard caps enforced by the host adapter: 9 evidence requests per consultation, 4,000 characters per result, 18,000 characters total. When a request would exceed the request or aggregate-character cap, the host returns one bounded refusal, performs exactly one final model round without tools, marks `details.oracle.exhausted`, and adds a concise warning to the result footer.
 
 ## Oracle mode
 
@@ -247,6 +253,8 @@ A consult that dies mid-stream is never returned as a normal answer:
 
 - provider error or abort → the tool call fails loudly, with the provider's error message and how much partial text had streamed before the failure
 - provider stops at its max output tokens → the answer is returned but visibly marked `⚠ [pitaj: provider stopped at max output tokens — answer may be incomplete]`, and counted under `truncated answers` in `/pitaj usage`
+- exact context/output caps → truncation markers and provider-warning text count toward the configured cap; tiny caps return a bounded prefix when a marker cannot fit
+- Oracle evidence budget exhaustion → one bounded refusal is followed by one tools-disabled final round; the final round keeps normal abort, provider-error, and length-stop semantics
 - misconfigured `autoRouteLow`/`autoRouteHigh` aliases → reported as a settings warning at load time, not on the first `auto` call
 
 ## Settings
@@ -352,7 +360,7 @@ context: none
 sidecar: no tools / no file access (no context provided)
 ```
 
-When advisory thresholds are reached, `warning: ...` lines are appended after the metadata.
+When advisory thresholds are reached, `warning: ...` lines are appended after the metadata. The `contextChars` and `answerChars` fields report the bounded text actually sent and returned.
 
 ## Testing
 

@@ -7,7 +7,15 @@ import {
 export const PITAJ_MODES = ["answer", "critique", "debug", "plan", "risk-check", "oracle"] as const;
 export const PITAJ_BREVITIES = ["short", "normal", "detailed"] as const;
 
+/**
+ * Modes that may be persisted or selected as `defaultMode`. Oracle is an
+ * explicit per-call mode only: it requires an approved `oracleRoot`, so a bare
+ * consult with `defaultMode: "oracle"` could never run.
+ */
+export const PITAJ_DEFAULT_MODES = ["answer", "critique", "debug", "plan", "risk-check"] as const;
+
 export type PitajMode = (typeof PITAJ_MODES)[number];
+export type PitajDefaultMode = (typeof PITAJ_DEFAULT_MODES)[number];
 export type PitajBrevity = (typeof PITAJ_BREVITIES)[number];
 
 export const PITAJ_AUTO_RISKS = ["low", "high"] as const;
@@ -19,7 +27,7 @@ export const DEFAULT_AUTO_ROUTE_HIGH = "opus";
 
 export interface PitajSettings {
 	defaultModel: string;
-	defaultMode: PitajMode;
+	defaultMode: PitajDefaultMode;
 	defaultBrevity: PitajBrevity;
 	maxContextChars?: number;
 	maxOutputChars?: number;
@@ -45,7 +53,7 @@ export interface SettingsSummary {
 	fileState: PitajSettingsFileState;
 	effective: {
 		defaultModel: string;
-		defaultMode: PitajMode;
+		defaultMode: PitajDefaultMode;
 		defaultBrevity: PitajBrevity;
 		maxContextChars?: number;
 		maxOutputChars?: number;
@@ -113,8 +121,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isPitajMode(value: unknown): value is PitajMode {
-	return typeof value === "string" && PITAJ_MODES.includes(value as PitajMode);
+function isPitajDefaultMode(value: unknown): value is PitajDefaultMode {
+	return typeof value === "string" && PITAJ_DEFAULT_MODES.includes(value as PitajDefaultMode);
 }
 
 function isPitajAutoRisk(value: unknown): value is PitajAutoRisk {
@@ -151,7 +159,7 @@ export function settingsFromUnknown(value: unknown): Partial<PitajSettings> {
 	if (!isRecord(value)) return {};
 	return {
 		defaultModel: trimmedNonEmptyString(value.defaultModel),
-		defaultMode: isPitajMode(value.defaultMode) ? value.defaultMode : undefined,
+		defaultMode: isPitajDefaultMode(value.defaultMode) ? value.defaultMode : undefined,
 		defaultBrevity: isPitajBrevity(value.defaultBrevity) ? value.defaultBrevity : undefined,
 		maxContextChars: positiveInteger(value.maxContextChars),
 		maxOutputChars: positiveInteger(value.maxOutputChars),
@@ -159,6 +167,23 @@ export function settingsFromUnknown(value: unknown): Partial<PitajSettings> {
 		autoRouteHigh: trimmedNonEmptyString(value.autoRouteHigh)?.toLowerCase(),
 		aliases: normalizeAliases(value.aliases),
 	};
+}
+
+/**
+ * Describe a persisted `defaultMode` that pitaj refuses to use as a default.
+ * Returns a settings warning string, or undefined when the stored value is a
+ * valid default mode or absent. Settings are never silently rewritten.
+ */
+export function warnInvalidPersistedDefaultMode(value: unknown): string | undefined {
+	if (!isRecord(value)) return undefined;
+	const stored = value.defaultMode;
+	if (stored === undefined || isPitajDefaultMode(stored)) return undefined;
+	const valid = `Valid values: ${PITAJ_DEFAULT_MODES.join(", ")}.`;
+	const fallback = `Using the built-in default "${DEFAULT_SETTINGS.defaultMode}".`;
+	if (stored === "oracle") {
+		return `pitaj settings.json defaultMode "oracle" is not a valid default; oracle is a per-call mode that needs an explicit oracleRoot. ${fallback} ${valid}`;
+	}
+	return `pitaj settings.json defaultMode ${JSON.stringify(stored)} is not a valid default. ${fallback} ${valid}`;
 }
 
 export function mergeSettings(overrides: Partial<PitajSettings> = {}): PitajSettings {
@@ -341,12 +366,21 @@ export function resolveMaxOutputChars(
 	return requestMaxOutputChars ?? settings.maxOutputChars ?? BREVITY_OUTPUT_CHARS[brevity];
 };
 
+interface QuoteAwareToken {
+	value: string;
+	quoted: boolean;
+}
+
 export function parseCommandArgs(args: string, settings: PitajSettings): ParsedCommandArgs {
 	const trimmed = args.trim();
 	if (!trimmed) return { question: "" };
 
 	// Pre-process: merge quoted tokens into single tokens
-	const tokens = tokenizeWithQuotes(trimmed);
+	return parseCommandTokens(tokenizeWithQuotes(trimmed).map(({ value }) => value), settings);
+}
+
+/** Parse already quote-aware tokens. Shared by `/pitaj` and `/pitaj auto`. */
+function parseCommandTokens(tokens: string[], settings: PitajSettings): ParsedCommandArgs {
 	let i = 0;
 
 	// Check if the first token is a known alias or provider/model
@@ -382,35 +416,89 @@ export function parseCommandArgs(args: string, settings: PitajSettings): ParsedC
 	return { model, question: questionParts.join(" ").trim(), mode, brevity, context };
 }
 
-/** Split on whitespace, but merge double-quoted segments into single tokens (quotes stripped). */
-function tokenizeWithQuotes(input: string): string[] {
+export interface ParsedAutoCommandArgs extends ParsedCommandArgs {
+	risk?: PitajAutoRisk;
+}
+
+/**
+ * Parse `/pitaj auto` arguments through the same quote-aware tokenizer as
+ * `/pitaj`. Only an unquoted, top-level `--risk low|high` token pair is
+ * consumed for routing; quoted risk text stays inside context or question text.
+ * Duplicate, missing, and invalid risk values are rejected instead of guessed.
+ */
+export function parseAutoCommandArgs(args: string, settings: PitajSettings): ParsedAutoCommandArgs {
+	const trimmed = args.trim();
+	if (!trimmed) return { question: "" };
+
+	const tokens = tokenizeWithQuotes(trimmed);
+	const remaining: string[] = [];
+	let risk: PitajAutoRisk | undefined;
+
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i];
+		if (token.quoted || token.value.toLowerCase() !== "--risk") {
+			remaining.push(token.value);
+			// Keep a context value with its `-c`/`--context` flag so a literal
+			// `--risk` used as that value cannot be mistaken for routing syntax.
+			if (!token.quoted && (token.value === "-c" || token.value === "--context") && i + 1 < tokens.length) {
+				remaining.push(tokens[++i].value);
+			}
+			continue;
+		}
+		if (risk !== undefined) {
+			throw new Error("pitaj auto: --risk was given more than once. Use a single --risk low or --risk high.");
+		}
+		const valueToken = tokens[i + 1];
+		if (valueToken === undefined) {
+			throw new Error("pitaj auto: --risk requires a value: low or high.");
+		}
+		if (valueToken.quoted) {
+			remaining.push(token.value, valueToken.value);
+			i++;
+			continue;
+		}
+		const value = valueToken.value;
+		i++;
+		const normalized = value.toLowerCase();
+		if (!isPitajAutoRisk(normalized)) {
+			throw new Error(`pitaj auto: --risk must be 'low' or 'high' (received "${value}").`);
+		}
+		risk = normalized;
+	}
+
+	return { ...parseCommandTokens(remaining, settings), ...(risk ? { risk } : {}) };
+}
+
+/** Split on whitespace, merge quoted segments, and retain whether each token was quoted. */
+function tokenizeWithQuotes(input: string): QuoteAwareToken[] {
 	// An unbalanced quote would silently corrupt every token after the stray
 	// character; fall back to plain whitespace splitting instead.
 	const quoteCount = (input.match(/"/g) ?? []).length;
 	if (quoteCount % 2 !== 0) {
-		return input.split(/\s+/).filter(Boolean);
+		return input.split(/\s+/).filter(Boolean).map((value) => ({ value, quoted: false }));
 	}
-	const tokens: string[] = [];
+	const tokens: QuoteAwareToken[] = [];
 	let current = "";
 	let inQuotes = false;
+	let tokenWasQuoted = false;
 
 	for (let i = 0; i < input.length; i++) {
 		const ch = input[i];
 		if (ch === '"') {
 			inQuotes = !inQuotes;
+			tokenWasQuoted = true;
 			continue; // strip quote character
 		}
 		if (ch === " " && !inQuotes) {
-			if (current) {
-				tokens.push(current);
-				current = "";
-			}
+			if (current) tokens.push({ value: current, quoted: tokenWasQuoted });
+			current = "";
+			tokenWasQuoted = false;
 			continue;
 		}
 		current += ch;
 	}
 
-	if (current) tokens.push(current);
+	if (current) tokens.push({ value: current, quoted: tokenWasQuoted });
 	return tokens;
 }
 
@@ -529,7 +617,10 @@ export function applyConfigUpdate(settings: PitajSettings, field: ConfigEditable
 		case "autoRouteHigh":
 			return { ...settings, autoRouteHigh: requireAlias(settings, value, field) };
 		case "defaultMode":
-			if (!isPitajMode(value)) throw new Error(`defaultMode must be one of: ${PITAJ_MODES.join(", ")}.`);
+			if (!isPitajDefaultMode(value)) {
+				const oracleNote = value === "oracle" ? " oracle is a per-call mode and cannot be a default." : "";
+				throw new Error(`defaultMode must be one of: ${PITAJ_DEFAULT_MODES.join(", ")}.${oracleNote}`);
+			}
 			return { ...settings, defaultMode: value };
 		case "defaultBrevity":
 			if (!isPitajBrevity(value)) throw new Error(`defaultBrevity must be one of: ${PITAJ_BREVITIES.join(", ")}.`);
@@ -555,11 +646,29 @@ export function formatSettingsChangeSummary(before: PitajSettings, after: PitajS
 	return lines.length > 0 ? lines.join("\n") : "No settings changes.";
 }
 
+/**
+ * Bound text to an exact character cap. The truncation marker is budgeted
+ * inside `maxChars`, so the returned string is never longer than the cap. A cap
+ * too small to hold the marker yields a cap-sized prefix instead of an overrun.
+ */
 export function truncateText(text: string, maxChars: number): string {
-	if (text.length <= maxChars) return text;
-	const head = text.slice(0, Math.max(0, maxChars));
-	const omitted = text.length - head.length;
-	return `${head}\n\n[pitaj truncated ${omitted} characters]`;
+	const cap = Math.max(0, Math.floor(maxChars));
+	if (text.length <= cap) return text;
+	if (cap === 0) return "";
+
+	const markerFor = (omitted: number): string => `\n\n[pitaj truncated ${omitted} characters]`;
+	const initialMarker = markerFor(text.length - cap);
+	if (initialMarker.length >= cap) return text.slice(0, cap);
+
+	let headLength = cap - initialMarker.length;
+	let marker = markerFor(text.length - headLength);
+	if (headLength + marker.length > cap) {
+		headLength = Math.max(0, headLength - (headLength + marker.length - cap));
+		marker = markerFor(text.length - headLength);
+	}
+	if (headLength === 0 || marker.length >= cap) return text.slice(0, cap);
+
+	return `${text.slice(0, headLength)}${marker}`.slice(0, cap);
 }
 
 /** Stream outcome facts `consultModel` extracts from the pi-ai response. */
@@ -596,15 +705,20 @@ export function finalizeConsultAnswer(
 			`pitaj consult failed mid-stream: ${detail} (received ${outcome.partialChars} chars of partial text before failure)`,
 		);
 	}
-	const trimmed = outcome.rawText.trim();
-	const locallyTruncated = trimmed.length > maxOutputChars;
-	let answer = truncateText(trimmed || "(pitaj returned no text)", maxOutputChars);
+	const cap = Math.max(0, Math.floor(maxOutputChars));
+	const body = outcome.rawText.trim() || "(pitaj returned no text)";
 	const providerTruncated = outcome.stopReason === "length";
-	if (providerTruncated) {
-		answer = `${answer}\n\n⚠ [pitaj: provider stopped at max output tokens — answer may be incomplete]`;
-	}
-	return { answer, truncated: providerTruncated || locallyTruncated };
+	// The provider-length warning is part of the returned answer, so it is
+	// budgeted inside the cap. A cap too small to hold it returns the bounded
+	// body alone rather than overrunning the caller's limit.
+	const warningFits = providerTruncated && PROVIDER_LENGTH_WARNING.length < cap;
+	const bounded = truncateText(body, warningFits ? cap - PROVIDER_LENGTH_WARNING.length : cap);
+	const answer = warningFits ? `${bounded}${PROVIDER_LENGTH_WARNING}` : bounded;
+	return { answer, truncated: providerTruncated || bounded.length < body.length };
 }
+
+/** Visible marker appended when the provider stopped at its max output tokens. */
+const PROVIDER_LENGTH_WARNING = "\n\n⚠ [pitaj: provider stopped at max output tokens — answer may be incomplete]";
 
 export function buildConsultSystemPrompt(
 	mode: PitajMode,
@@ -649,11 +763,22 @@ export function buildConsultSystemPrompt(
 	].join("\n");
 }
 
+/**
+ * Bound caller-provided manual context to the configured character cap. Returns
+ * the exact context text sent to the sidecar, or "" when there is none, so
+ * `contextChars` can report what was actually sent rather than what was offered.
+ */
+export function boundConsultContext(context: string | undefined, maxContextChars: number): string {
+	const trimmed = context?.trim();
+	if (!trimmed) return "";
+	return truncateText(trimmed, maxContextChars);
+}
+
 export function buildConsultUserText(question: string, context: string | undefined, maxContextChars: number): string {
-	const trimmedContext = context?.trim();
+	const boundedContext = boundConsultContext(context, maxContextChars);
 	const sections: string[] = [];
-	if (trimmedContext) {
-		sections.push(`## Context\n\n${truncateText(trimmedContext, maxContextChars)}`);
+	if (boundedContext) {
+		sections.push(`## Context\n\n${boundedContext}`);
 	}
 	sections.push(`## Question\n\n${question.trim()}`);
 	return sections.join("\n\n");
@@ -763,6 +888,10 @@ export function formatResultForDisplay(
 		for (const warning of warnings) {
 			if (warning?.trim()) footerLines.push(`warning: ${warning.trim()}`);
 		}
+	}
+
+	if (details.settingsWarning?.trim()) {
+		footerLines.push(`settings warning: ${details.settingsWarning.trim()}`);
 	}
 
 	if (details.mode === "oracle") {

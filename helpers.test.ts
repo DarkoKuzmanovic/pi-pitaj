@@ -7,6 +7,8 @@ import {
 	CONFIG_EDITABLE_FIELDS,
 	USAGE_BUDGET,
 	buildConsultSystemPrompt,
+	buildConsultUserText,
+	boundConsultContext,
 	classifySpecialCommand,
 	isAdviseFlagViolation,
 	applyConfigUpdate,
@@ -30,6 +32,7 @@ import {
 	settingsFromUnknown,
 	serializeSettings,
 	summarizeSettings,
+	finalizeConsultAnswer,
 	truncateText,
 } from "./helpers.ts";
 import { buildSnapshotCommandRequest, parseSnapshotCommandArgs } from "./index.ts";
@@ -56,8 +59,93 @@ describe("pitaj prompt shaping", () => {
 		assert.match(prompt, /short/i);
 	});
 
-	it("truncates text with an explicit omitted-character marker", () => {
-		assert.equal(truncateText("abcdef", 4), "abcd\n\n[pitaj truncated 2 characters]");
+	it("truncates text with an explicit omitted-character marker budgeted inside the cap", () => {
+		const bounded = truncateText("a".repeat(100), 50);
+		assert.equal(bounded.length, 50);
+		assert.match(bounded, /\[pitaj truncated 83 characters\]$/);
+	});
+});
+
+describe("pitaj exact text caps", () => {
+	const caps = [0, 1, 2, 5, 10, 30, 32, 33, 34, 50, 100, 4_000];
+	const texts = ["", "a", "short text", "x".repeat(120), "y".repeat(10_000)];
+
+	it("never returns more characters than the cap allows", () => {
+		for (const cap of caps) {
+			for (const text of texts) {
+				const bounded = truncateText(text, cap);
+				assert.ok(
+					bounded.length <= cap,
+					`truncateText(len=${text.length}, cap=${cap}) returned ${bounded.length} chars`,
+				);
+			}
+		}
+	});
+
+	it("returns a cap-sized prefix when the marker cannot fit", () => {
+		assert.equal(truncateText("abcdef", 0), "");
+		assert.equal(truncateText("abcdef", 1), "a");
+		assert.equal(truncateText("abcdef", 4), "abcd");
+	});
+
+	it("leaves text that already fits untouched", () => {
+		assert.equal(truncateText("abc", 10), "abc");
+		assert.equal(truncateText("abc", 3), "abc");
+		assert.equal(truncateText("", 0), "");
+	});
+
+	it("bounds manual context to the configured cap", () => {
+		for (const cap of caps) {
+			const bounded = boundConsultContext("  ".concat("c".repeat(500)), cap);
+			assert.ok(bounded.length <= cap, `boundConsultContext(cap=${cap}) returned ${bounded.length} chars`);
+			assert.ok(buildConsultUserText("q?", "c".repeat(500), cap).length <= cap + "## Context\n\n\n\n## Question\n\nq?".length);
+		}
+		assert.equal(boundConsultContext(undefined, 100), "");
+		assert.equal(boundConsultContext("   ", 100), "");
+		assert.equal(boundConsultContext(" keep me ", 100), "keep me");
+	});
+
+	it("sends exactly the bounded context in the user text", () => {
+		const bounded = boundConsultContext("c".repeat(500), 60);
+		const userText = buildConsultUserText("why?", "c".repeat(500), 60);
+		assert.equal(bounded.length, 60);
+		assert.ok(userText.includes(`## Context\n\n${bounded}`));
+		assert.ok(userText.endsWith("## Question\n\nwhy?"));
+	});
+
+	it("keeps the final answer inside maxOutputChars including markers and warnings", () => {
+		for (const cap of caps) {
+			for (const stopReason of ["stop", "length"] as const) {
+				for (const rawText of ["", "tiny", "z".repeat(5_000)]) {
+					const { answer } = finalizeConsultAnswer(
+						{ stopReason, rawText, partialChars: rawText.length },
+						cap,
+					);
+					assert.ok(
+						answer.length <= cap,
+						`finalizeConsultAnswer(${stopReason}, len=${rawText.length}, cap=${cap}) returned ${answer.length} chars`,
+					);
+				}
+			}
+		}
+	});
+
+	it("drops the provider-length warning rather than overrunning a tiny cap", () => {
+		const tiny = finalizeConsultAnswer({ stopReason: "length", rawText: "hello there", partialChars: 11 }, 5);
+		assert.equal(tiny.answer, "hello");
+		assert.equal(tiny.truncated, true);
+		assert.doesNotMatch(tiny.answer, /provider stopped/);
+	});
+
+	it("keeps the provider-length warning when it fits inside the cap", () => {
+		const { answer, truncated } = finalizeConsultAnswer(
+			{ stopReason: "length", rawText: "w".repeat(500), partialChars: 500 },
+			200,
+		);
+		assert.ok(answer.length <= 200);
+		assert.match(answer, /provider stopped at max output tokens/);
+		assert.match(answer, /\[pitaj truncated \d+ characters\]/);
+		assert.equal(truncated, true);
 	});
 });
 
@@ -305,7 +393,7 @@ describe("runtime snapshot collection seam", () => {
 		assert.match(input?.content ?? "", /edit/);
 		assert.match(input?.content ?? "", /bash/);
 		assert.doesNotMatch(input?.content ?? "", /first-result/);
-		assert.ok((input?.content.length ?? 0) <= 140);
+		assert.ok((input?.content?.length ?? 0) <= 140);
 		assert.match(input?.content ?? "", /truncated/);
 	});
 
@@ -379,7 +467,10 @@ describe("runtime snapshot collection seam", () => {
 		const registered: Array<{ event: string; handler: (event: { toolName: string; result: unknown; isError: boolean }) => void }> = [];
 		const registeredOk = registerSnapshotToolResultCapture(
 			{
-				on: (event, handler) => registered.push({ event, handler }),
+				on: (
+					event: string,
+					handler: (event: { toolName: string; result: unknown; isError: boolean }) => void,
+				) => registered.push({ event, handler }),
 			},
 			buffer,
 		);

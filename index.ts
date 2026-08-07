@@ -7,6 +7,7 @@ import { Type } from "typebox";
 import {
 	buildConsultSystemPrompt,
 	buildConsultUserText,
+	boundConsultContext,
 	CONFIG_EDITABLE_FIELDS,
 	DEFAULT_MAX_CONTEXT_CHARS,
 	applyConfigUpdate,
@@ -14,10 +15,12 @@ import {
 	formatSettingsChangeSummary,
 	mergeSettings,
 	planSettingsWrite,
+	parseAutoCommandArgs,
 	parseCommandArgs,
 	serializeSettings,
 	PITAJ_AUTO_RISKS,
 	PITAJ_BREVITIES,
+	PITAJ_DEFAULT_MODES,
 	PITAJ_MODES,
 	classifySpecialCommand,
 	formatResultForDisplay,
@@ -28,6 +31,7 @@ import {
 	resolveModelRef,
 	settingsFromUnknown,
 	summarizeSettings,
+	warnInvalidPersistedDefaultMode,
 	type PitajSettingsFileState,
 	type ConfigEditableField,
 	truncateText,
@@ -38,6 +42,7 @@ import {
 	finalizeConsultAnswer,
 	validateAutoRouteAliases,
 	type PitajSettings,
+	type ParsedAutoCommandArgs,
 	type ParsedCommandArgs,
 } from "./helpers.ts";
 import { buildRuntimeSnapshotInput, SnapshotToolResultBuffer, registerSnapshotToolResultCapture, type SnapshotRuntimeSessionManager } from "./snapshot-runtime.ts";
@@ -105,6 +110,7 @@ interface PitajResultDetails {
 		requestsUsed: number;
 		totalEvidenceChars: number;
 		hostActionsAutomatic: false;
+		exhausted?: boolean;
 	};
 }
 
@@ -139,7 +145,12 @@ function loadSettings(): LoadedSettings {
 
 	try {
 		const parsed = JSON.parse(readFileSync(SETTINGS_PATH, "utf-8")) as unknown;
-		return withAutoRouteWarning({ settings: mergeSettings(settingsFromUnknown(parsed)), fileState: "loaded" });
+		const defaultModeWarning = warnInvalidPersistedDefaultMode(parsed);
+		return withAutoRouteWarning({
+			settings: mergeSettings(settingsFromUnknown(parsed)),
+			fileState: "loaded",
+			...(defaultModeWarning ? { warning: defaultModeWarning } : {}),
+		});
 	} catch (error) {
 		return {
 			settings: mergeSettings(),
@@ -212,6 +223,45 @@ function getTextContent(message: AssistantMessage): string {
 		.join("\n");
 }
 
+function hasMeaningfulUsage(usage: AssistantMessage["usage"] | undefined): usage is AssistantMessage["usage"] {
+	if (!usage) return false;
+	return [
+		usage.input,
+		usage.output,
+		usage.cacheRead,
+		usage.cacheWrite,
+		usage.totalTokens,
+		usage.cost.input,
+		usage.cost.output,
+		usage.cost.cacheRead,
+		usage.cost.cacheWrite,
+		usage.cost.total,
+	].some((value) => value > 0);
+}
+
+/** Combine real completed nested-model usage without inventing zero-usage rounds. */
+function addCompletedRoundUsage(
+	total: AssistantMessage["usage"] | undefined,
+	round: AssistantMessage["usage"] | undefined,
+): AssistantMessage["usage"] | undefined {
+	if (!hasMeaningfulUsage(round)) return total;
+	if (!total) return { ...round, cost: { ...round.cost } };
+	return {
+		input: total.input + round.input,
+		output: total.output + round.output,
+		cacheRead: total.cacheRead + round.cacheRead,
+		cacheWrite: total.cacheWrite + round.cacheWrite,
+		totalTokens: total.totalTokens + round.totalTokens,
+		cost: {
+			input: total.cost.input + round.cost.input,
+			output: total.cost.output + round.cost.output,
+			cacheRead: total.cost.cacheRead + round.cost.cacheRead,
+			cacheWrite: total.cost.cacheWrite + round.cost.cacheWrite,
+			total: total.cost.total + round.cost.total,
+		},
+	};
+}
+
 /** Exported for behavior tests; `streamImpl` is a DI seam for a fake stream. */
 export async function consultModel(
 	request: PitajRequest,
@@ -220,7 +270,8 @@ export async function consultModel(
 	loaded?: LoadedSettings,
 	onUpdate?: (update: { content: { type: "text"; text: string }[] }) => void,
 	streamImpl: typeof stream = stream,
-): Promise<{ answer: string; details: PitajResultDetails }> {
+	executeEvidenceImpl: typeof executeOracleEvidence = executeOracleEvidence,
+): Promise<{ answer: string; details: PitajResultDetails; usage?: AssistantMessage["usage"] }> {
 	const resolvedLoaded = loaded ?? loadSettings();
 	const settings = resolvedLoaded.settings;
 	const question = request.question.trim();
@@ -248,8 +299,10 @@ export async function consultModel(
 	const brevity = request.brevity ?? settings.defaultBrevity;
 	const maxContextChars = request.maxContextChars ?? settings.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS;
 	const maxOutputChars = resolveMaxOutputChars(request.maxOutputChars, settings, brevity);
-	const context = request.context?.trim();
-	const userText = buildConsultUserText(question, context, maxContextChars);
+	// Bound the context once so the request and its reported contextChars
+	// describe the same text.
+	const boundedContext = boundConsultContext(request.context, maxContextChars);
+	const userText = buildConsultUserText(question, boundedContext, maxContextChars);
 	const startedAt = Date.now();
 	const userMessage: Message = {
 		role: "user",
@@ -258,9 +311,11 @@ export async function consultModel(
 	};
 	const messages: Message[] = [userMessage];
 	let evidenceBudget = createOracleBudgetState();
+	let evidenceExhausted = false;
 	let response: AssistantMessage | undefined;
 	let terminalText = "";
 	let streamError: unknown;
+	let combinedUsage: AssistantMessage["usage"] | undefined;
 
 	while (true) {
 		const streamResponse = streamImpl(
@@ -269,7 +324,7 @@ export async function consultModel(
 				? {
 					systemPrompt: buildConsultSystemPrompt(mode, brevity, maxEvidenceRequests),
 					messages,
-					tools: [PITAJ_EVIDENCE_TOOL],
+					...(evidenceExhausted ? {} : { tools: [PITAJ_EVIDENCE_TOOL] }),
 				}
 				: {
 					systemPrompt: buildConsultSystemPrompt(mode, brevity),
@@ -289,15 +344,17 @@ export async function consultModel(
 			streamError = error;
 		}
 		response = await streamResponse.result();
+		combinedUsage = addCompletedRoundUsage(combinedUsage, response.usage);
 		terminalText = roundText;
-		if (mode !== "oracle" || response.stopReason !== "toolUse") break;
+		if (mode !== "oracle" || response.stopReason !== "toolUse" || evidenceExhausted) break;
 
 		const toolCalls = response.content.filter(
 			(part): part is Extract<AssistantMessage["content"][number], { type: "toolCall" }> => part.type === "toolCall",
 		);
 		if (toolCalls.length === 0) throw new Error("Oracle model requested evidence without a tool call.");
-		messages.push(response);
 		let exhausted = false;
+		const toolResults: ToolResultMessage[] = [];
+		const persistedToolCallIds = new Set<string>();
 		for (const toolCall of toolCalls) {
 			const check = checkEvidenceBudget(evidenceBudget, maxEvidenceRequests);
 			let result: { content: string; isError: boolean };
@@ -314,7 +371,7 @@ export async function consultModel(
 					ORACLE_MAX_TOTAL_CHARS - evidenceBudget.totalChars,
 				);
 				if (!oracleRoot) throw new Error("Oracle mode is missing its approved repository root.");
-				result = await executeOracleEvidence(oracleRoot, toolCall.arguments as unknown, remainingChars);
+				result = await executeEvidenceImpl(oracleRoot, toolCall.arguments as unknown, remainingChars);
 				evidenceBudget = consumeEvidenceBudget(evidenceBudget, result.isError ? 0 : result.content.length);
 			}
 			const toolResult: ToolResultMessage = {
@@ -325,9 +382,18 @@ export async function consultModel(
 				isError: result.isError,
 				timestamp: Date.now(),
 			};
-			messages.push(toolResult);
+			toolResults.push(toolResult);
+			persistedToolCallIds.add(toolCall.id);
+			if (exhausted) break;
 		}
-		if (exhausted) throw new Error("Oracle evidence request limit reached; no further evidence requests are allowed.");
+		const persistedResponse: AssistantMessage = {
+			...response,
+			content: response.content.filter(
+				(part) => part.type !== "toolCall" || persistedToolCallIds.has(part.id),
+			),
+		};
+		messages.push(persistedResponse, ...toolResults);
+		if (exhausted) evidenceExhausted = true;
 	}
 
 	if (!response) throw new Error("pitaj did not produce a response.");
@@ -345,13 +411,14 @@ export async function consultModel(
 
 	return {
 		answer,
+		...(combinedUsage ? { usage: combinedUsage } : {}),
 		details: {
 			model: resolved.resolved,
 			...(resolved.alias ? { alias: resolved.alias } : {}),
 			mode,
 			brevity,
 			question,
-			contextChars: context?.length ?? 0,
+			contextChars: boundedContext.length,
 			answerChars: answer.length,
 			maxOutputChars,
 			answer,
@@ -363,6 +430,7 @@ export async function consultModel(
 						requestsUsed: evidenceBudget.requestsUsed,
 						totalEvidenceChars: evidenceBudget.totalChars,
 						hostActionsAutomatic: false as const,
+						...(evidenceExhausted ? { exhausted: true } : {}),
 					},
 				}
 				: {}),
@@ -440,12 +508,13 @@ function fieldFromConfigOption(option: string, settings: PitajSettings): ConfigE
 	return CONFIG_EDITABLE_FIELDS.find((field) => option === configFieldOption(field, settings));
 }
 
-async function promptConfigValue(ctx: ExtensionContext, settings: PitajSettings, field: ConfigEditableField): Promise<string | undefined> {
+/** Prompt for one config field value. Exported so the offered choices are testable. */
+export async function promptConfigValue(ctx: ExtensionContext, settings: PitajSettings, field: ConfigEditableField): Promise<string | undefined> {
 	if (field === "autoRouteLow" || field === "autoRouteHigh") {
 		const aliases = Object.keys(settings.aliases).sort((a, b) => a.localeCompare(b));
 		return ctx.ui.select(`Choose ${field} alias`, aliases);
 	}
-	if (field === "defaultMode") return ctx.ui.select("Choose default mode", [...PITAJ_MODES]);
+	if (field === "defaultMode") return ctx.ui.select("Choose default mode", [...PITAJ_DEFAULT_MODES]);
 	if (field === "defaultBrevity") return ctx.ui.select("Choose default brevity", [...PITAJ_BREVITIES]);
 	const current = settings[field] === undefined ? "" : String(settings[field]);
 	const hint = field === "maxContextChars" || field === "maxOutputChars" ? "blank/default/clear uses the built-in default" : current;
@@ -672,7 +741,13 @@ function buildErrorDetails(params: PitajRequest, loaded: LoadedSettings): PitajR
 	};
 }
 
-export default function pitaj(pi: ExtensionAPI): void {
+const ORACLE_EXHAUSTION_WARNING = "Oracle evidence budget exhausted; final answer used no further tools.";
+
+function displayWarningsForResult(details: PitajResultDetails, warnings: readonly string[]): readonly string[] {
+	return details.oracle?.exhausted ? [...warnings, ORACLE_EXHAUSTION_WARNING] : warnings;
+}
+
+export default function pitaj(pi: ExtensionAPI, streamImpl: typeof stream = stream): void {
 	const snapshotToolResults = new SnapshotToolResultBuffer();
 	registerSnapshotToolResultCapture(pi, snapshotToolResults);
 	const usageRecorder = createUsageRecorder();
@@ -719,13 +794,14 @@ export default function pitaj(pi: ExtensionAPI): void {
 			contentUpdate?.({ content: [{ type: "text", text: "pitaj is asking..." }] });
 			const loaded = loadSettings();
 			try {
-				const result = await consultModel(params, ctx, signal, loaded, contentUpdate);
+				const result = await consultModel(params, ctx, signal, loaded, contentUpdate, streamImpl);
 				recordUsageFromDetails(params, result.details, { success: true });
 				const { totals } = usageRecorder.snapshot();
 				const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
 				return {
-					content: [{ type: "text", text: formatResultForDisplay(result.answer, result.details, { warnings }) }],
+					content: [{ type: "text", text: formatResultForDisplay(result.answer, result.details, { warnings: displayWarningsForResult(result.details, warnings) }) }],
 					details: result.details,
+					...(result.usage ? { usage: result.usage } : {}),
 				};
 			} catch (error) {
 				const message = errorMessage(error);
@@ -785,21 +861,16 @@ export default function pitaj(pi: ExtensionAPI): void {
 			if (specialCommand === "auto") {
 				const autoArgs = trimmed.substring("auto".length).trim();
 
-				// Extract --risk flag BEFORE parsing (parseCommandArgs doesn't recognize it)
-				let risk: PitajAutoRisk | undefined;
-				const riskMatch = autoArgs.match(/--risk\s+(\S+)/i);
-				if (riskMatch) {
-					const rawRisk = riskMatch[1].toLowerCase();
-					if (rawRisk !== "low" && rawRisk !== "high") {
-						ctx.ui.notify("pitaj auto: --risk must be 'low' or 'high'", "error");
-						return;
-					}
-					risk = rawRisk as PitajAutoRisk;
+				// The auto parser shares the quote-aware tokenizer, so a quoted
+				// "--risk high" stays in the context or question instead of routing.
+				let parsed: ParsedAutoCommandArgs;
+				try {
+					parsed = parseAutoCommandArgs(autoArgs, loaded.settings);
+				} catch (error) {
+					ctx.ui.notify(errorMessage(error), "error");
+					return;
 				}
-
-				// Strip --risk from args so it doesn't leak into the question or clobber -c context
-				const cleanedArgs = autoArgs.replace(/--risk\s+\S+/i, "").trim();
-				const parsed = parseCommandArgs(cleanedArgs, loaded.settings);
+				const risk = parsed.risk;
 
 				let question = parsed.question;
 				if (!question && ctx.hasUI) {
@@ -830,7 +901,7 @@ export default function pitaj(pi: ExtensionAPI): void {
 					recordUsageFromDetails(autoRequest, result.details, { success: true });
 					const { totals } = usageRecorder.snapshot();
 					const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
-					const display = formatResultForDisplay(result.answer, result.details, { warnings });
+					const display = formatResultForDisplay(result.answer, result.details, { warnings: displayWarningsForResult(result.details, warnings) });
 					pi.sendMessage({
 						customType: "pitaj",
 						content: display,
@@ -897,7 +968,7 @@ export default function pitaj(pi: ExtensionAPI): void {
 					const { totals } = usageRecorder.snapshot();
 					const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
 
-					const advisoryContent = formatResultForDisplay(result.answer, details, { warnings, isAdvisory: true });
+					const advisoryContent = formatResultForDisplay(result.answer, details, { warnings: displayWarningsForResult(details, warnings), isAdvisory: true });
 
 					pi.sendMessage({
 						customType: "pitaj",
@@ -955,7 +1026,7 @@ export default function pitaj(pi: ExtensionAPI): void {
 				const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
 					pi.sendMessage({
 						customType: "pitaj",
-						content: formatResultForDisplay(result.answer, details, { warnings }),
+						content: formatResultForDisplay(result.answer, details, { warnings: displayWarningsForResult(details, warnings) }),
 						display: true,
 						details,
 					});
@@ -1003,7 +1074,7 @@ export default function pitaj(pi: ExtensionAPI): void {
 				const warnings = buildInlineWarnings(applyUsageWarningFlags(totals));
 				pi.sendMessage({
 					customType: "pitaj",
-					content: formatResultForDisplay(result.answer, result.details, { warnings }),
+					content: formatResultForDisplay(result.answer, result.details, { warnings: displayWarningsForResult(result.details, warnings) }),
 					display: true,
 					details: result.details,
 				});

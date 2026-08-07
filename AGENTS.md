@@ -45,10 +45,13 @@ settings.json           ← Runtime model aliases / defaults
 4. `resolveModelRef()` maps aliases to provider/model IDs.
 5. Model is resolved through `ctx.modelRegistry` and API credentials are loaded.
 6. A compact prompt is built (mode + brevity, optional context, optional truncation).
-7. `stream()` runs the consultation; `finalizeConsultAnswer()` turns the stream outcome into a final answer or a loud failure:
+7. `stream()` runs each consultation round; Oracle tool rounds are serially mediated by the host.
+8. After each completed `streamResponse.result()` round, real `AssistantMessage.usage` is accumulated once and returned as nested tool `usage` when available.
+9. Oracle request/character exhaustion → one bounded refusal, then exactly one final round with tools omitted; `details.oracle.exhausted` is set and the display footer warns the caller.
+10. `finalizeConsultAnswer()` turns the terminal stream outcome into a final answer or a loud failure:
    - `stopReason: "error"` / `"aborted"` → throw (a dead stream is never returned as a normal answer; the error carries the provider message and partial-text size)
-   - `stopReason: "length"` → answer returned but visibly marked as provider-truncated, `truncated` recorded in details and usage
-8. Answer is returned and displayed by Pi; usage is recorded (including a truncated-answers count shown by `/pitaj usage`).
+   - `stopReason: "length"` → answer returned but visibly marked as provider-truncated, `truncated` recorded in details
+11. Answer is returned and displayed by Pi; coarse in-memory usage counters remain separate from nested provider token/cost usage.
 
 ## Configuration
 

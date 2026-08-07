@@ -19,52 +19,50 @@
 - **started-at:** 2026-08-07T00:32:35+02:00
 - **first-worker-at:** 2026-08-07T00:35:00+02:00
 - **completed-at:** pending
-- **dispatches:** 6 delivered
-- **burned:** 0
-- **review-bundles:** 1
-- **review-dispatches:** 3
-- **worker-retries:** 0
-- **compactions:** 1
+- **dispatches:** 12 delivered
+- **burned:** 1
+- **review-bundles:** 2
+- **review-dispatches:** 5
+- **worker-retries:** 1
+- **compactions:** 2
 
 ## M3 — Correctness, privacy, accounting, and Oracle evidence hardening
 
 - [x] **M3.1 — Make Oracle evidence complete within its declared bounds and enforce the active-workspace trust boundary**
-- [ ] **M3.2 — Make consultation parsing, defaults, truncation, accounting, and evidence exhaustion match their public contracts**
+- [x] **M3.2 — Make consultation parsing, defaults, truncation, accounting, and evidence exhaustion match their public contracts**
 - [ ] **M3.3 — Make snapshot and failure metadata structurally accurate**
 - [ ] **M3.4 — Restore package verification hygiene and reconcile the integrated documentation contract**
 
-### M3.1 — Completed outcome
+### M3.2 — Gated outcome
 
 **Acceptance criteria**
 
-- Git-backed search finds tracked and non-ignored untracked files without the current 64-file traversal false negative.
-- Oracle rejects a valid Git root outside the canonical workspace containing `ctx.cwd` before model streaming.
-- Secret scanning permits TypeScript password type declarations while continuing to refuse credential-looking values.
-- Oracle operation enums serialize through Pi’s documented Google-compatible `StringEnum` shape.
-- Fractional evidence-request limits are rejected at schema and runtime boundaries.
-- `git_diff` reports staged plus unstaged tracked changes, excludes untracked files explicitly, and returns bounded explicit failure for oversized subprocess output.
-- Focused tests cover every changed invariant; the full test suite passes.
-- README and AGENTS describe the actual root, search, secret, enum, budget, and diff behavior.
+- `oracle` remains an explicit per-call mode but cannot be persisted or selected as `defaultMode`; invalid persisted state falls back safely with a clear warning.
+- Manual context and final answers never exceed their configured character caps. Truncation markers and provider-length warnings are budgeted inside the cap when they fit; tiny caps return a cap-sized prefix rather than overrunning. `contextChars` and `answerChars` report bounded text.
+- `/pitaj auto --risk low|high` uses the quote-aware parser. Only top-level flags are consumed; quoted/literal question text survives; duplicate, missing, and invalid risk values are rejected.
+- Nested model `usage` is aggregated across all completed stream rounds and returned through Pi’s registered tool result without fabricated or double-counted usage.
+- Oracle evidence exhaustion appends one refusal result, performs exactly one final tools-disabled round, exposes `exhausted: true`, preserves terminal stop semantics, and executes no host evidence after exhaustion.
+- Focused regressions and the full suite pass; README and AGENTS match shipped behavior.
 
 **Runway**
 
-- `consultModel()` calls `approveOracleRoot()` before model resolution/streaming.
-- `executeOracleEvidence()` owns host-mediated operations; `searchFiles()` consumes Git-backed `collectSearchCandidates()` and `gitDiff()` owns tracked diff output.
-- `oracle-policy.ts` owns operation lists, secret refusal, evidence limits, and truncation.
-- Test seams already exist in `oracle.test.ts`, `oracle-policy.test.ts`, and `consult-behavior.test.ts`.
-- Installed Pi `docs/extensions.md` and `examples/extensions/README.md` require `StringEnum` and allow nested tool `usage`; `examples/extensions/summarize.ts` demonstrates model-registry nested calls.
+- `settingsFromUnknown()`, config validation, and config-choice rendering own the default-mode boundary.
+- `truncateText()`, `buildConsultUserText()`, and `finalizeConsultAnswer()` own exact text caps and bounded metadata.
+- `parseCommandArgs()` and the `/pitaj auto` route own quote-aware risk parsing.
+- `consultModel()` owns serial stream rounds, evidence exhaustion, and usage aggregation; the registered `pitaj` tool result is the Pi accounting boundary.
+- Installed Pi `docs/extensions.md`, `docs/packages.md`, and `examples/extensions/summarize.ts` define nested model streaming and result usage.
 
 **Current wave**
 
-- [x] Add failing regression tests for search coverage, workspace-root rejection, password declarations, schema shape, fractional budgets, and staged/oversized diff behavior.
-- [x] Implement the smallest owning-boundary fixes in `oracle.ts`, `oracle-policy.ts`, and the Oracle setup path in `index.ts`.
-- [x] Reconcile README and AGENTS for the shipped M3.1 behavior.
-- [x] Run focused and full verification.
+- [x] Add failing regressions for default-mode exclusion, exact caps, quote-aware risk parsing, nested usage aggregation, and graceful exhaustion.
+- [x] Implement the smallest owning-boundary fixes in `helpers.ts` and `index.ts`.
+- [x] Reconcile README and AGENTS with M3.2 behavior.
+- [x] Run focused tests, full `npm test`, strict TypeScript for product plus changed tests, and `git diff --check`.
 - [x] Run one fresh-context deep combined review; resolve blockers within the bounded Full-tier fix cycles.
 
-**Counters:** dispatches: 6/8 (delivered) · burned: 0 · review-bundles: 1 · review-dispatches: 3 · fix-cycles: 2/2 · oracle: 0 · worker-retries: 0 · direct-edits: 0
+**Counters:** dispatches: 4/8 (delivered) · burned: 1 · review-bundles: 1 · review-dispatches: 2 · fix-cycles: 1/2 · oracle: 0 · worker-retries: 1 · direct-edits: 0
 
-**Documentation:** README and AGENTS reconciled with the M3.1 trust, search, budget, secret, schema, and diff contracts.
+**Documentation:** README and AGENTS cover default-mode exclusion, quote-aware risk parsing, exact caps, nested provider usage, and graceful Oracle exhaustion.
 
 ## Conventions
 
@@ -73,6 +71,7 @@
 - `ROADMAP.md` gained a concurrent unrelated argument-completions idea during M3.1. Never edit, restore, stage, or commit that line in this outcome.
 - Implementation workers do not commit. The orchestrator stages explicit paths and commits only after the outcome gate passes.
 - Pi API work must follow installed `docs/extensions.md`, `docs/packages.md`, `examples/extensions/README.md`, and the closest shipped source examples; do not infer signatures from compiled internals.
+- The failed first M3.2 worker left an in-scope, green partial baseline for default-mode exclusion, exact caps, and quote-aware risk parsing. Recovery work must preserve and audit it rather than restart or rewrite it.
 
 ## Gate log
 
@@ -90,6 +89,17 @@
 - 2026-08-07 — M3.1 final fix-back: current-filesystem path validation now allows absent staged/deleted paths after lexical checks while preserving stable-path checks for existing paths; exact regression RED then 226/226 GREEN.
 - 2026-08-07 — M3.1 final independent verification: 226/226 tests, strict TypeScript, and diff check passed; owning-boundary path logic inspected.
 - 2026-08-07 — M3.1 final deep review: exact unborn staged-add/delete probe returned both diff halves; 226/226 tests, strict TypeScript, and diff check passed; reviewer verdict APPROVE. Accepted non-blocking note: conservative `Readonly<string>` password declaration false positive.
+- 2026-08-07 — M3.1 gated commit: `14316b8 feat(m3.1): harden Oracle evidence boundaries`; explicit outcome files only, with unrelated ROADMAP/settings changes left unstaged.
+- 2026-08-07 — Protected-outcome checkpoint: M3.1 complete; M3.2 activated under the existing Full / contained-protected / local scope.
+- 2026-08-07 — M3.2 worker failure: hard-lane Opus hit its output-token limit after 77 tool calls while implementing five contracts; classified as task breadth/model-output exhaustion. The partial default/cap/risk patch passes 257/257 tests. One retry is authorized with a narrower remaining contract and normal lane; 1 burned, 0 delivered.
+- 2026-08-07 — M3.2 recovery worker: nested usage and graceful exhaustion completed on the green partial baseline; 263/263 tests, 1 delivered dispatch.
+- 2026-08-07 — M3.2 supervisor check: unmatched sibling tool calls after the single exhaustion refusal would violate Anthropic/OpenAI history protocols. Locked minimal fix: filter the persisted assistant turn to text plus only tool calls that received results. Independent strict TypeScript also exposed one new settings assertion error and three known helper-test strictness errors now inside a changed test file; all must be clean before review.
+- 2026-08-07 — M3.2 protocol follow-up: persisted assistant history now keeps only tool calls with matching results; multi-call exhaustion regression added; strict changed-test errors cleared. Independent verification: 264/264 tests, exact strict TypeScript command, and diff check passed.
+- 2026-08-07 — M3.2 documentation reconciliation: README and AGENTS now cover all five contracts; diff, fence, and internal-anchor checks passed; 1 delivered dispatch.
+- 2026-08-07 — M3.2 deep review: two blockers found. Quoted standalone `"--risk"` tokens lose quote metadata and are consumed as syntax; invalid persisted-default warnings remain hidden from registered-tool content. Caps, usage, exhaustion, full tests, strict TypeScript, and diff checks otherwise passed. One fix cycle returned to the recovery worker.
+- 2026-08-07 — M3.2 fix-back: quote metadata now survives standalone quoted `"--risk"` tokens, and persisted settings warnings are visible in registered-tool content. Focused 47/47 and full 266/266 tests, strict TypeScript, and diff check passed; 1 delivered dispatch.
+- 2026-08-07 — M3.2 final deep recheck: both former counterexamples passed, real unquoted risk routing remained correct, and cap, usage, and Oracle exhaustion contracts stayed green. Reviewer verdict APPROVE after focused 210/210, full 266/266, strict TypeScript, and scoped diff check; 1 review dispatch.
+- 2026-08-07 — M3.2 gate passed under Full-tier ceremony after one bounded fix cycle; explicit outcome files committed with unrelated ROADMAP/settings changes left unstaged.
 
 ## Deferred
 
@@ -100,4 +110,4 @@
 
 ## Handoff
 
-No handoff yet. M3.1 is the active outcome; later outcomes remain intentionally undecomposed until M3.1 evidence is gated.
+M3.1 is gated at `14316b8`. M3.2 is gated by the `feat(m3.2): harden consultation contracts` commit. M3.3 is next: make snapshot and failure metadata structurally accurate. Unrelated `ROADMAP.md` and `settings.json` changes remain unstaged and excluded.

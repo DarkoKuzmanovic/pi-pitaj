@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
 	PITAJ_AUTO_RISKS,
 	mergeSettings,
+	parseAutoCommandArgs,
 	resolveAutoRoute,
 	resolveModelRef,
 } from "./helpers.ts";
+import pitaj from "./index.ts";
 
 describe("pitaj auto routing", () => {
 	it("routes high risk to opus with risk-check suggestion when mode omitted", () => {
@@ -78,6 +81,63 @@ describe("pitaj auto routing", () => {
 			() => resolveAutoRoute({ risk: "medium" as never }, settings),
 			/Unknown pitaj auto risk "medium"/,
 		);
+	});
+
+	it("routes a parsed top-level risk flag through the same auto router", () => {
+		const settings = mergeSettings();
+		const high = parseAutoCommandArgs("--risk high Is this architecture safe?", settings);
+		assert.equal(resolveAutoRoute({ risk: high.risk, mode: high.mode }, settings).alias, "opus");
+
+		const low = parseAutoCommandArgs("--mode debug --risk low check this assertion", settings);
+		assert.equal(resolveAutoRoute({ risk: low.risk, mode: low.mode }, settings).alias, "gpt");
+	});
+
+	it("does not route on quoted risk text", () => {
+		const settings = mergeSettings();
+		const parsed = parseAutoCommandArgs('-c "--risk high" what breaks?', settings);
+		assert.equal(resolveAutoRoute({ risk: parsed.risk, mode: parsed.mode }, settings).alias, "gpt");
+	});
+
+	it("rejects a malformed risk flag before starting any consult", async () => {
+		for (const [args, expected] of [
+			["auto --risk low --risk high which one?", /--risk was given more than once/],
+			["auto --risk medium why?", /must be 'low' or 'high'/],
+			["auto is this safe? --risk", /--risk requires a value/],
+		] as const) {
+			const notifications: string[] = [];
+			let handler: ((commandArgs: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
+			const api = {
+				on() {},
+				registerTool() {},
+				registerCommand(_name: string, options: { handler: typeof handler }) {
+					handler = options.handler;
+				},
+			} as unknown as ExtensionAPI;
+			pitaj(api);
+			if (!handler) throw new Error("pitaj did not register its command");
+
+			const ctx = {
+				hasUI: false,
+				ui: {
+					notify(message: string) {
+						notifications.push(message);
+					},
+					setStatus() {},
+				},
+				modelRegistry: {
+					find() {
+						throw new Error("no consult may start for a malformed risk flag");
+					},
+				},
+			} as unknown as ExtensionCommandContext;
+
+			await handler(args, ctx);
+			assert.ok(
+				notifications.some((message) => expected.test(message)),
+				`expected ${expected} in ${JSON.stringify(notifications)}`,
+			);
+			assert.ok(!notifications.some((message) => /pitaj auto failed/.test(message)));
+		}
 	});
 
 	it("keeps manual model resolution separate from auto routing hints", () => {

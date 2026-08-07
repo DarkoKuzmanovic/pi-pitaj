@@ -4,6 +4,8 @@ import { describe, it } from "node:test";
 import {
 	BREVITY_OUTPUT_CHARS,
 	CONFIG_EDITABLE_FIELDS,
+	PITAJ_DEFAULT_MODES,
+	PITAJ_MODES,
 	applyConfigUpdate,
 	formatConfigSummaryText,
 	formatResultForDisplay,
@@ -18,7 +20,9 @@ import {
 	serializeSettings,
 	settingsFromUnknown,
 	summarizeSettings,
+	warnInvalidPersistedDefaultMode,
 } from "./helpers.ts";
+import { promptConfigValue } from "./index.ts";
 import { createUsageRecorder } from "./usage.ts";
 
 const SETTINGS_PATH = "/home/quzma/.pi/agent/extensions/pi-pitaj/settings.json";
@@ -357,5 +361,66 @@ describe("interactive config update helpers", () => {
 		assert.match(indexSource, /pitaj config save failed/);
 		assert.match(indexSource, /loaded\.fileState === "malformed"/);
 		assert.match(indexSource, /Alias editing is manual in M2/);
+	});
+});
+
+describe("pitaj default mode excludes oracle", () => {
+	it("keeps oracle in the explicit mode surface but out of the default-mode surface", () => {
+		assert.ok(PITAJ_MODES.includes("oracle"));
+		assert.deepEqual([...PITAJ_DEFAULT_MODES], ["answer", "critique", "debug", "plan", "risk-check"]);
+	});
+
+	it("drops a persisted defaultMode of oracle so bare consults keep working", () => {
+		const parsed = settingsFromUnknown({ defaultMode: "oracle" });
+		assert.equal(parsed.defaultMode, undefined);
+		assert.equal(mergeSettings(parsed).defaultMode, "answer");
+	});
+
+	it("keeps ordinary persisted default modes", () => {
+		assert.equal(settingsFromUnknown({ defaultMode: "plan" }).defaultMode, "plan");
+		assert.equal(warnInvalidPersistedDefaultMode({ defaultMode: "plan" }), undefined);
+		assert.equal(warnInvalidPersistedDefaultMode({}), undefined);
+		assert.equal(warnInvalidPersistedDefaultMode("not-an-object"), undefined);
+	});
+
+	it("warns clearly about a persisted oracle default mode", () => {
+		const warning = warnInvalidPersistedDefaultMode({ defaultMode: "oracle" }) ?? "";
+		assert.match(warning, /defaultMode "oracle"/);
+		assert.match(warning, /per-call/i);
+		assert.match(warning, /answer, critique, debug, plan, risk-check/);
+	});
+
+	it("warns about any other invalid persisted default mode", () => {
+		const warning = warnInvalidPersistedDefaultMode({ defaultMode: "wrong" }) ?? "";
+		assert.match(warning, /defaultMode "wrong"/);
+		assert.match(warning, /answer, critique, debug, plan, risk-check/);
+		assert.doesNotMatch(warning, /per-call/i);
+	});
+
+	it("rejects an interactive defaultMode of oracle and keeps ordinary modes", () => {
+		const settings = mergeSettings();
+		assert.throws(() => applyConfigUpdate(settings, "defaultMode", "oracle"), /per-call/i);
+		assert.throws(() => applyConfigUpdate(settings, "defaultMode", "oracle"), /answer, critique, debug, plan, risk-check/);
+		assert.equal(applyConfigUpdate(settings, "defaultMode", "plan").defaultMode, "plan");
+	});
+
+	it("never offers oracle in the interactive default-mode choices", async () => {
+		const offered: string[][] = [];
+		const ctx = {
+			ui: {
+				async select(_label: string, options: string[]) {
+					offered.push(options);
+					return options[0];
+				},
+				async input() {
+					return undefined;
+				},
+			},
+		} as unknown as Parameters<typeof promptConfigValue>[0];
+
+		await promptConfigValue(ctx, mergeSettings(), "defaultMode");
+		assert.deepEqual(offered, [[...PITAJ_DEFAULT_MODES]]);
+		const offeredModes: string[] = [...(offered[0] ?? [])];
+		assert.ok(!offeredModes.includes("oracle"));
 	});
 });

@@ -15,7 +15,11 @@ import {
 	approveOracleRoot,
 	executeOracleEvidence,
 } from "./oracle.ts";
-import { ORACLE_EVIDENCE_OPERATIONS, ORACLE_MAX_EVIDENCE_REQUESTS } from "./oracle-policy.ts";
+import {
+	ORACLE_EVIDENCE_OPERATIONS,
+	ORACLE_MAX_EVIDENCE_REQUESTS,
+	ORACLE_MAX_TOTAL_CHARS,
+} from "./oracle-policy.ts";
 
 function execGit(cwd: string, args: string[]): Promise<void> {
 	return new Promise((resolve, reject) => {
@@ -311,11 +315,24 @@ describe("Oracle host evidence adapter", () => {
 	});
 });
 
+type StreamUsage = {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	totalTokens: number;
+	cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+};
+
+type StreamToolCall = { id: string; name?: string; arguments: Record<string, unknown> };
+
 type StreamStep = {
 	stopReason: "stop" | "length" | "toolUse" | "error" | "aborted";
 	text?: string;
-	toolCall?: { id: string; name?: string; arguments: Record<string, unknown> };
+	toolCall?: StreamToolCall;
+	toolCalls?: StreamToolCall[];
 	errorMessage?: string;
+	usage?: StreamUsage;
 };
 
 function streamSequence(steps: StreamStep[], calls: unknown[][]): typeof stream {
@@ -324,9 +341,17 @@ function streamSequence(steps: StreamStep[], calls: unknown[][]): typeof stream 
 		calls.push(args);
 		const step = steps[index++];
 		if (!step) throw new Error("unexpected extra stream round");
-		const content = step.toolCall
-			? [{ type: "toolCall", id: step.toolCall.id, name: step.toolCall.name ?? PITAJ_EVIDENCE_TOOL_NAME, arguments: step.toolCall.arguments }]
-			: [{ type: "text", text: step.text ?? "" }];
+		const toolCalls = step.toolCalls ?? (step.toolCall ? [step.toolCall] : []);
+		const content = [
+			...(step.text === undefined ? [] : [{ type: "text" as const, text: step.text }]),
+			...toolCalls.map((toolCall) => ({
+				type: "toolCall" as const,
+				id: toolCall.id,
+				name: toolCall.name ?? PITAJ_EVIDENCE_TOOL_NAME,
+				arguments: toolCall.arguments,
+			})),
+		];
+		if (content.length === 0) content.push({ type: "text", text: "" });
 		return {
 			async *[Symbol.asyncIterator]() {
 				if (step.text) yield { type: "text_delta", delta: step.text };
@@ -337,10 +362,22 @@ function streamSequence(steps: StreamStep[], calls: unknown[][]): typeof stream 
 					content,
 					stopReason: step.stopReason,
 					...(step.errorMessage ? { errorMessage: step.errorMessage } : {}),
+					...(step.usage ? { usage: step.usage } : {}),
 				};
 			},
 		};
 	}) as unknown as typeof stream;
+}
+
+function usageFor(input: number, output: number): StreamUsage {
+	return {
+		input,
+		output,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: input + output,
+		cost: { input: input / 100, output: output / 100, cacheRead: 0, cacheWrite: 0, total: (input + output) / 100 },
+	};
 }
 
 function fakeContext(
@@ -402,6 +439,62 @@ describe("public pitaj tool schema", () => {
 		};
 		assert.equal(schema.properties.maxEvidenceRequests.type, "integer");
 		assert.equal(schema.properties.maxEvidenceRequests.minimum, 1);
+	});
+
+	it("returns nested model usage in the registered pitaj tool result", async () => {
+		let registeredTool: unknown;
+		const api = {
+			on() {},
+			registerTool(tool: unknown) {
+				registeredTool = tool;
+			},
+			registerCommand() {},
+		} as unknown as ExtensionAPI;
+		pitaj(api, streamSequence([{ stopReason: "stop", text: "ok", usage: usageFor(4, 3) }], []));
+		if (!registeredTool || typeof registeredTool !== "object") throw new Error("pitaj did not register its tool");
+		const execute = (registeredTool as { execute?: (...args: unknown[]) => Promise<unknown> }).execute;
+		if (!execute) throw new Error("pitaj did not register an execute function");
+
+		const output = (await execute("call-1", { question: "q", model: "opus" }, undefined, undefined, fakeContext())) as {
+			usage?: unknown;
+		};
+		assert.deepEqual(output.usage, usageFor(4, 3));
+	});
+
+	it("surfaces the exhaustion warning through the registered tool display", async () => {
+		const root = await makeRepository();
+		let registeredTool: unknown;
+		const api = {
+			on() {},
+			registerTool(tool: unknown) {
+				registeredTool = tool;
+			},
+			registerCommand() {},
+		} as unknown as ExtensionAPI;
+		pitaj(
+			api,
+			streamSequence(
+				[
+					{ stopReason: "toolUse", toolCall: { id: "call-1", arguments: { operation: "read_file", path: "source.ts" } } },
+					{ stopReason: "toolUse", toolCall: { id: "call-2", arguments: { operation: "read_file", path: "source.ts" } } },
+					{ stopReason: "stop", text: "Final answer." },
+				],
+				[],
+			),
+		);
+		if (!registeredTool || typeof registeredTool !== "object") throw new Error("pitaj did not register its tool");
+		const execute = (registeredTool as { execute?: (...args: unknown[]) => Promise<unknown> }).execute;
+		if (!execute) throw new Error("pitaj did not register an execute function");
+
+		const output = (await execute(
+			"call-1",
+			{ question: "q", model: "opus", mode: "oracle", oracleRoot: root, maxEvidenceRequests: 1 },
+			undefined,
+			undefined,
+			fakeContext([], root),
+		)) as { content: Array<{ type: string; text?: string }>; details: { oracle?: { exhausted?: boolean } } };
+		assert.equal(output.details.oracle?.exhausted, true);
+		assert.match(output.content[0]?.text ?? "", /Oracle evidence budget exhausted/);
 	});
 });
 
@@ -487,23 +580,172 @@ describe("Oracle serial consult loop", () => {
 		assert.equal(calls.length, 0);
 	});
 
-	it("refuses and terminates the tenth evidence request without executing it", async () => {
+	it("returns one bounded refusal and one tools-disabled final round at request exhaustion", async () => {
 		const root = await makeRepository();
 		const calls: unknown[][] = [];
-		const step = (id: string): StreamStep => ({ stopReason: "toolUse", toolCall: { id, arguments: { operation: "read_file", path: "source.ts" } } });
-		const evidenceSteps = Array.from({ length: 10 }, (_, index) => step(`call-${index + 1}`));
+		let hostCalls = 0;
+		const executeEvidence = async () => {
+			hostCalls += 1;
+			return { content: "bounded evidence", isError: false };
+		};
+		const result = await consultModel(
+			{ question: "q", model: "opus", mode: "oracle", oracleRoot: root, maxEvidenceRequests: 1 },
+			fakeContext([], root),
+			undefined,
+			LOADED,
+			undefined,
+			streamSequence(
+				[
+					{ stopReason: "toolUse", toolCall: { id: "call-1", arguments: { operation: "read_file", path: "source.ts" } }, usage: usageFor(3, 2) },
+					{ stopReason: "toolUse", toolCall: { id: "call-2", arguments: { operation: "read_file", path: "source.ts" } }, usage: usageFor(5, 4) },
+					{ stopReason: "stop", text: "Final answer.", usage: usageFor(7, 6) },
+				],
+				calls,
+			),
+			executeEvidence,
+		);
+
+		assert.equal(result.answer, "Final answer.");
+		assert.equal(hostCalls, 1);
+		assert.equal(calls.length, 3);
+		assert.equal(result.usage?.input, 15);
+		assert.equal(result.usage?.output, 12);
+		assert.equal(result.usage?.totalTokens, 27);
+		assert.ok(Math.abs((result.usage?.cost.input ?? 0) - 0.15) < Number.EPSILON);
+		assert.equal(result.details.oracle?.exhausted, true);
+
+		const finalContext = calls[2][1] as { tools?: unknown; messages: Array<Record<string, unknown>> };
+		assert.equal(finalContext.tools, undefined);
+		const refusals = finalContext.messages.filter((message) => message.role === "toolResult" && message.isError === true);
+		assert.equal(refusals.length, 1);
+		assert.match(JSON.stringify(refusals[0]), /evidence budget exhausted/);
+	});
+	it("drops sibling tool calls after the single exhaustion refusal", async () => {
+		const root = await makeRepository();
+		const calls: unknown[][] = [];
+		let hostCalls = 0;
+		const executeEvidence = async () => {
+			hostCalls += 1;
+			return { content: "bounded evidence", isError: false };
+		};
+		const result = await consultModel(
+			{ question: "q", model: "opus", mode: "oracle", oracleRoot: root, maxEvidenceRequests: 1 },
+			fakeContext([], root),
+			undefined,
+			LOADED,
+			undefined,
+			streamSequence(
+				[
+					{
+						stopReason: "toolUse",
+						text: "Need evidence.",
+						toolCalls: [
+							{ id: "call-1", arguments: { operation: "read_file", path: "source.ts" } },
+							{ id: "call-2", arguments: { operation: "read_file", path: "source.ts" } },
+							{ id: "call-3", arguments: { operation: "read_file", path: "source.ts" } },
+						],
+					},
+					{ stopReason: "stop", text: "Final answer." },
+				],
+				calls,
+			),
+			executeEvidence,
+		);
+
+		assert.equal(result.answer, "Final answer.");
+		assert.equal(hostCalls, 1);
+		assert.equal(calls.length, 2);
+		assert.equal(result.details.oracle?.exhausted, true);
+
+		const finalContext = calls[1][1] as {
+			tools?: unknown;
+			messages: Array<{
+				role?: string;
+				content?: Array<{ type?: string; id?: string; text?: string }>;
+				toolCallId?: string;
+				isError?: boolean;
+			}>;
+		};
+		assert.equal(finalContext.tools, undefined);
+		const persistedAssistant = finalContext.messages.find((message) => message.role === "assistant");
+		if (!persistedAssistant?.content) throw new Error("missing persisted assistant message");
+		assert.equal(persistedAssistant.content[0]?.text, "Need evidence.");
+		const persistedToolCallIds = persistedAssistant.content
+			.filter((part) => part.type === "toolCall")
+			.map((part) => part.id ?? "");
+		const persistedResultMessages = finalContext.messages.filter((message) => message.role === "toolResult");
+		const persistedResultIds = persistedResultMessages.map((message) => message.toolCallId ?? "");
+		assert.deepEqual(persistedToolCallIds, ["call-1", "call-2"]);
+		assert.deepEqual(persistedResultIds, persistedToolCallIds);
+		assert.equal(persistedResultMessages.filter((message) => message.isError).length, 1);
+		assert.doesNotMatch(JSON.stringify(finalContext.messages), /call-3/);
+	});
+
+	it("detects aggregate-character exhaustion without any post-cap host operation", async () => {
+		const root = await makeRepository();
+		const calls: unknown[][] = [];
+		let hostCalls = 0;
+		const executeEvidence = async () => {
+			hostCalls += 1;
+			return { content: "x".repeat(ORACLE_MAX_TOTAL_CHARS), isError: false };
+		};
+		const result = await consultModel(
+			{ question: "q", model: "opus", mode: "oracle", oracleRoot: root },
+			fakeContext([], root),
+			undefined,
+			LOADED,
+			undefined,
+			streamSequence(
+				[
+					{ stopReason: "toolUse", toolCall: { id: "call-1", arguments: { operation: "read_file", path: "source.ts" } } },
+					{ stopReason: "toolUse", toolCall: { id: "call-2", arguments: { operation: "read_file", path: "source.ts" } } },
+					{ stopReason: "stop", text: "Aggregate cap answer." },
+				],
+				calls,
+			),
+			executeEvidence,
+		);
+
+		assert.equal(result.answer, "Aggregate cap answer.");
+		assert.equal(hostCalls, 1);
+		assert.equal(result.details.oracle?.exhausted, true);
+		assert.equal(calls.length, 3);
+		const finalContext = calls[2][1] as { tools?: unknown; messages: Array<Record<string, unknown>> };
+		assert.equal(finalContext.tools, undefined);
+		assert.equal(finalContext.messages.filter((message) => message.role === "toolResult" && message.isError === true).length, 1);
+	});
+
+	it("preserves a final provider error after graceful exhaustion", async () => {
+		const root = await makeRepository();
+		const calls: unknown[][] = [];
+		let hostCalls = 0;
+		const executeEvidence = async () => {
+			hostCalls += 1;
+			return { content: "bounded evidence", isError: false };
+		};
 		await assert.rejects(
 			consultModel(
-				{ question: "q", model: "opus", mode: "oracle", oracleRoot: root },
+				{ question: "q", model: "opus", mode: "oracle", oracleRoot: root, maxEvidenceRequests: 1 },
 				fakeContext([], root),
 				undefined,
 				LOADED,
 				undefined,
-				streamSequence(evidenceSteps, calls),
+				streamSequence(
+					[
+						{ stopReason: "toolUse", toolCall: { id: "call-1", arguments: { operation: "read_file", path: "source.ts" } } },
+						{ stopReason: "toolUse", toolCall: { id: "call-2", arguments: { operation: "read_file", path: "source.ts" } } },
+						{ stopReason: "error", text: "partial", errorMessage: "final provider failed" },
+					],
+					calls,
+				),
+				executeEvidence,
 			),
-			/evidence request limit reached/,
+			/final provider failed/,
 		);
-		assert.equal(calls.length, 10);
+		assert.equal(hostCalls, 1);
+		assert.equal(calls.length, 3);
+		const finalContext = calls[2][1] as { tools?: unknown };
+		assert.equal(finalContext.tools, undefined);
 	});
 
 	it("keeps auto routing and terminal length behavior in Oracle mode", async () => {

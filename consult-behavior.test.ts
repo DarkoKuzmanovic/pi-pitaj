@@ -3,10 +3,12 @@ import { describe, it } from "node:test";
 import type { stream } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+	boundConsultContext,
 	buildUsageSummary,
 	createUsageStore,
 	finalizeConsultAnswer,
 	formatUsageSummaryText,
+	formatResultForDisplay,
 	isAdviseFlagViolation,
 	mergeSettings,
 	parseCommandArgs,
@@ -85,6 +87,20 @@ describe("finalizeConsultAnswer", () => {
 	});
 });
 
+describe("result formatting", () => {
+	it("surfaces persisted settings warnings in visible content", () => {
+		const display = formatResultForDisplay("answer", {
+			model: "openai/test",
+			mode: "answer",
+			brevity: "short",
+			contextChars: 0,
+			settingsWarning: 'pitaj settings.json defaultMode "oracle" is not a valid default.',
+		});
+
+		assert.match(display, /settings warning:.*defaultMode "oracle"/);
+	});
+});
+
 // ---------------------------------------------------------------------------
 // consultModel — behavior tests through a fake stream (replaces the old
 // source-grepping "wiring contract" tests with executable ones)
@@ -96,6 +112,14 @@ type FakeStreamPlan = {
 	errorMessage?: string;
 	throwMidStream?: Error;
 	finalText?: string;
+	usage?: {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		totalTokens: number;
+		cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+	};
 };
 
 function fakeStreamImpl(plan: FakeStreamPlan, calls: unknown[][] = []): typeof stream {
@@ -115,6 +139,7 @@ function fakeStreamImpl(plan: FakeStreamPlan, calls: unknown[][] = []): typeof s
 					content: [{ type: "text", text: plan.finalText ?? deltas.join("") }],
 					stopReason: plan.stopReason,
 					...(plan.errorMessage ? { errorMessage: plan.errorMessage } : {}),
+					...(plan.usage ? { usage: plan.usage } : {}),
 				};
 			},
 		};
@@ -153,9 +178,54 @@ describe("consultModel behavior", () => {
 			fakeStreamImpl({ deltas: ["The ", "answer."], stopReason: "stop" }),
 		);
 		assert.equal(result.answer, "The answer.");
+
+		assert.equal(result.usage, undefined);
 		assert.equal(result.details.model, "anthropic/claude-opus-4-8");
 		assert.equal(result.details.alias, "opus");
 		assert.equal(result.details.truncated, undefined);
+	});
+
+	it("returns the completed round's real usage", async () => {
+		const usage = {
+			input: 11,
+			output: 7,
+			cacheRead: 2,
+			cacheWrite: 1,
+			totalTokens: 21,
+			cost: { input: 0.11, output: 0.07, cacheRead: 0.02, cacheWrite: 0.01, total: 0.21 },
+		};
+		const result = await consultModel(
+			{ question: "q", model: "opus" },
+			fakeCtx(),
+			undefined,
+			LOADED,
+			undefined,
+			fakeStreamImpl({ deltas: ["ok"], stopReason: "stop", usage }),
+		);
+
+		assert.deepEqual(result.usage, usage);
+	});
+
+	it("does not fabricate usage for missing or zero completed-round usage", async () => {
+		const zeroUsage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		for (const usage of [undefined, zeroUsage]) {
+			const result = await consultModel(
+				{ question: "q", model: "opus" },
+				fakeCtx(),
+				undefined,
+				LOADED,
+				undefined,
+				fakeStreamImpl({ deltas: ["ok"], stopReason: "stop", usage }),
+			);
+			assert.equal(result.usage, undefined);
+		}
 	});
 
 	it("intercepts model 'auto' and resolves the routed alias before the registry lookup", async () => {
@@ -220,6 +290,42 @@ describe("consultModel behavior", () => {
 		assert.match(result.answer, /provider stopped at max output tokens/);
 		assert.equal(result.details.truncated, true);
 		assert.equal(result.details.stopReason, "length");
+	});
+
+	it("reports the bounded context actually sent and the bounded answer actually returned", async () => {
+		const calls: unknown[][] = [];
+		const rawContext = "c".repeat(5_000);
+		const result = await consultModel(
+			{ question: "q", model: "opus", context: rawContext, maxContextChars: 120, maxOutputChars: 90 },
+			fakeCtx(),
+			undefined,
+			LOADED,
+			undefined,
+			fakeStreamImpl({ deltas: ["a".repeat(4_000)], stopReason: "length" }, calls),
+		);
+
+		const boundedContext = boundConsultContext(rawContext, 120);
+		assert.equal(boundedContext.length, 120);
+		assert.equal(result.details.contextChars, boundedContext.length);
+		assert.ok(result.answer.length <= 90);
+		assert.equal(result.details.answerChars, result.answer.length);
+
+		const sent = (calls[0][1] as { messages: Array<{ content: Array<{ text: string }> }> }).messages[0].content[0].text;
+		assert.ok(sent.includes(`## Context\n\n${boundedContext}`));
+		assert.ok(!sent.includes("c".repeat(200)));
+	});
+
+	it("reports zero context chars when no context is provided", async () => {
+		const result = await consultModel(
+			{ question: "q", model: "opus", context: "   " },
+			fakeCtx(),
+			undefined,
+			LOADED,
+			undefined,
+			fakeStreamImpl({ deltas: ["ok"], stopReason: "stop" }),
+		);
+		assert.equal(result.details.contextChars, 0);
+		assert.equal(result.details.answerChars, result.answer.length);
 	});
 
 	it("rejects aborted consults", async () => {
