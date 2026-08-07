@@ -160,6 +160,19 @@ function fakeCtx(findCalls: Array<{ provider: string; modelId: string }> = []): 
 	} as unknown as ExtensionContext;
 }
 
+function fakeAuthFailureCtx(message = "missing credentials"): ExtensionContext {
+	return {
+		modelRegistry: {
+			find(provider: string, modelId: string) {
+				return { provider, id: modelId };
+			},
+			async getApiKeyAndHeaders() {
+				return { ok: false, error: message };
+			},
+		},
+	} as unknown as ExtensionContext;
+}
+
 const LOADED = {
 	settings: mergeSettings({
 		aliases: { opus: "anthropic/claude-opus-4-8", gpt: "openai-codex/gpt-5.5" },
@@ -243,6 +256,174 @@ describe("consultModel behavior", () => {
 		assert.deepEqual(findCalls, [{ provider: "anthropic", modelId: "claude-opus-4-8" }]);
 		assert.equal(result.details.autoRouted, true);
 		assert.match(result.details.routingReason ?? "", /risk=high/);
+	});
+
+	it("preserves base facts when a blank question fails before routing", async () => {
+		const loaded = {
+			...LOADED,
+			settings: mergeSettings({
+				...LOADED.settings,
+				defaultMode: "debug",
+				defaultBrevity: "detailed",
+			}),
+		};
+		await assert.rejects(
+			consultModel(
+				{
+					model: "auto",
+					risk: "high",
+					question: " \t ",
+					context: "123456789",
+					maxContextChars: 6,
+					maxOutputChars: 321,
+				},
+				fakeCtx(),
+				undefined,
+				loaded,
+				undefined,
+				fakeStreamImpl({ deltas: ["unused"], stopReason: "stop" }),
+			),
+			(error: unknown) => {
+				const facts = (error as { facts?: Record<string, unknown> }).facts;
+				assert.ok(facts);
+				assert.equal(facts.mode, "debug");
+				assert.equal(facts.brevity, "detailed");
+				assert.equal(facts.risk, "high");
+				assert.equal(facts.autoRouted, true);
+				assert.equal(facts.contextChars, boundConsultContext("123456789", 6).length);
+				assert.equal(facts.maxOutputChars, 321);
+				assert.equal(facts.model, undefined);
+				assert.equal(facts.alias, undefined);
+				assert.equal(facts.routingReason, undefined);
+				return /needs a question/.test(String(error));
+			},
+		);
+	});
+
+	it("preserves base facts when an auto-route alias is missing", async () => {
+		const loaded = {
+			...LOADED,
+			settings: mergeSettings({
+				...LOADED.settings,
+				defaultMode: "debug",
+				defaultBrevity: "detailed",
+				autoRouteLow: "missing",
+			}),
+		};
+		await assert.rejects(
+			consultModel(
+				{
+					model: "auto",
+					risk: "low",
+					question: "q",
+					context: "123456789",
+					maxContextChars: 6,
+					maxOutputChars: 321,
+				},
+				fakeCtx(),
+				undefined,
+				loaded,
+				undefined,
+				fakeStreamImpl({ deltas: ["unused"], stopReason: "stop" }),
+			),
+			(error: unknown) => {
+				const facts = (error as { facts?: Record<string, unknown> }).facts;
+				assert.ok(facts);
+				assert.equal(facts.mode, "debug");
+				assert.equal(facts.brevity, "detailed");
+				assert.equal(facts.risk, "low");
+				assert.equal(facts.autoRouted, true);
+				assert.equal(facts.contextChars, boundConsultContext("123456789", 6).length);
+				assert.equal(facts.maxOutputChars, 321);
+				assert.equal(facts.model, undefined);
+				assert.equal(facts.alias, undefined);
+				assert.equal(facts.routingReason, undefined);
+				assert.equal(facts.autoSuggestedMode, undefined);
+				return /requires a non-empty \"missing\" alias/.test(String(error));
+			},
+		);
+	});
+
+	it("preserves effective facts for failed default, explicit, and auto-routed auth setups", async () => {
+		const cases: Array<{
+			name: string;
+			request: Parameters<typeof consultModel>[0];
+			expected: {
+				model: string;
+				alias: string;
+				mode: string;
+				brevity: string;
+				autoRouted: boolean;
+				routingReason?: RegExp;
+			};
+		}> = [
+			{
+				name: "default model",
+				request: { question: "q" },
+				expected: { model: "anthropic/claude-opus-4-8", alias: "opus", mode: "answer", brevity: "short", autoRouted: false },
+			},
+			{
+				name: "explicit alias",
+				request: { model: "opus", question: "q", mode: "critique", brevity: "detailed", risk: "high" as const },
+				expected: { model: "anthropic/claude-opus-4-8", alias: "opus", mode: "critique", brevity: "detailed", autoRouted: false },
+			},
+			{
+				name: "auto low",
+				request: { model: "auto", question: "q", risk: "low" as const },
+				expected: { model: "openai-codex/gpt-5.5", alias: "gpt", mode: "answer", brevity: "short", autoRouted: true, routingReason: /risk=low/ },
+			},
+			{
+				name: "auto high",
+				request: { model: "auto", question: "q", risk: "high" as const },
+				expected: { model: "anthropic/claude-opus-4-8", alias: "opus", mode: "risk-check", brevity: "short", autoRouted: true, routingReason: /risk=high/ },
+			},
+			{
+				name: "auto risk-check",
+				request: { model: "auto", question: "q", mode: "risk-check" as const },
+				expected: { model: "anthropic/claude-opus-4-8", alias: "opus", mode: "risk-check", brevity: "short", autoRouted: true, routingReason: /mode=risk-check/ },
+			},
+		];
+
+		for (const testCase of cases) {
+			await assert.rejects(
+				consultModel(testCase.request, fakeAuthFailureCtx(), undefined, LOADED, undefined, fakeStreamImpl({ deltas: ["unused"], stopReason: "stop" })),
+				(error: unknown) => {
+					const facts = (error as { facts?: Record<string, unknown> }).facts;
+					assert.ok(facts, `${testCase.name} should expose effective facts`);
+					assert.equal(facts.model, testCase.expected.model);
+					assert.equal(facts.alias, testCase.expected.alias);
+					assert.equal(facts.mode, testCase.expected.mode);
+					assert.equal(facts.brevity, testCase.expected.brevity);
+					assert.equal(facts.autoRouted, testCase.expected.autoRouted);
+					if (testCase.expected.routingReason) {
+						assert.match(String(facts.routingReason), testCase.expected.routingReason);
+					}
+					return true;
+				},
+			);
+		}
+	});
+
+	it("preserves effective facts for a failed provider stream", async () => {
+		await assert.rejects(
+			consultModel(
+				{ model: "opus", question: "q", mode: "debug", brevity: "short" },
+				fakeCtx(),
+				undefined,
+				LOADED,
+				undefined,
+				fakeStreamImpl({ deltas: ["partial"], stopReason: "error", errorMessage: "provider down" }),
+			),
+			(error: unknown) => {
+				const facts = (error as { facts?: Record<string, unknown> }).facts;
+				assert.ok(facts);
+				assert.equal(facts.model, "anthropic/claude-opus-4-8");
+				assert.equal(facts.alias, "opus");
+				assert.equal(facts.mode, "debug");
+				assert.equal(facts.brevity, "short");
+				return /failed mid-stream: provider down/.test(String(error));
+			},
+		);
 	});
 
 	it("rejects mid-stream provider errors instead of returning partial text", async () => {

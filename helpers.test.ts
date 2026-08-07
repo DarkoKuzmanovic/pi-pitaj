@@ -377,6 +377,126 @@ describe("snapshot contract", () => {
 			assert.notEqual(result.metadata.find((item) => item.category === category)?.status, "included");
 		}
 	});
+
+	it("marks a section removed by the whole-snapshot bound as omitted", () => {
+		const input = {
+			question: "Review this change.",
+			categories: [
+				{
+					category: "active-plan" as const,
+					title: "Active plan",
+					content: "This plan should be omitted by the final bound.",
+					sourceKind: "custom-entry" as const,
+					sourceLabel: "caller plan",
+				},
+			],
+		};
+		const complete = buildSnapshotContext({ ...input, maxContextChars: 2_000 });
+		const activeStart = complete.context.indexOf("## Active plan");
+
+		let cut: ReturnType<typeof buildSnapshotContext> | undefined;
+		for (let maxContextChars = 120; maxContextChars <= 900; maxContextChars += 1) {
+			const candidate = buildSnapshotContext({ ...input, maxContextChars });
+			const cutoff = candidate.context.lastIndexOf(`\n\n[snapshot truncated to ${maxContextChars} chars]`);
+			if (cutoff >= 0 && cutoff < activeStart) {
+				cut = candidate;
+				break;
+			}
+		}
+
+		assert.ok(cut, "expected a bound before the active-plan section");
+		assert.equal(cut.metadata.find((item) => item.category === "active-plan")?.status, "omitted");
+		assert.ok(cut.omittedCategories.includes("active-plan"));
+	});
+
+	it("keeps duplicate section content independently included", () => {
+		const result = buildSnapshotContext({
+			question: "same section text",
+			maxContextChars: 2_000,
+			categories: [
+				{
+					category: "recent-user-request",
+					title: "Recent user request",
+					content: "same section text",
+					sourceKind: "bounded-session",
+					sourceLabel: "recent",
+				},
+			],
+		});
+
+		assert.equal(result.metadata.find((item) => item.category === "question")?.status, "included");
+		assert.equal(result.metadata.find((item) => item.category === "recent-user-request")?.status, "included");
+		assert.equal(result.metadata.find((item) => item.category === "question")?.charCount, 17);
+		assert.equal(result.metadata.find((item) => item.category === "recent-user-request")?.charCount, 17);
+	});
+
+	it("does not infer inclusion from a question embedding another section rendering", () => {
+		const activeContent = "Keep this exact section text.";
+		const embeddedActiveSection = `## Active plan\n[snapshot:active-plan — 1 item, ${activeContent.length} chars, source: plan]\n\n${activeContent}`;
+		const input = {
+			question: `Question includes this duplicate:\n${embeddedActiveSection}`,
+			categories: [
+				{
+					category: "active-plan" as const,
+					title: "Active plan",
+					content: activeContent,
+					sourceKind: "custom-entry" as const,
+					sourceLabel: "plan",
+				},
+			],
+		};
+		const complete = buildSnapshotContext({ ...input, maxContextChars: 2_000 });
+		const activeStart = complete.context.lastIndexOf("## Active plan");
+
+		let cut: ReturnType<typeof buildSnapshotContext> | undefined;
+		for (let maxContextChars = 350; maxContextChars <= 900; maxContextChars += 1) {
+			const candidate = buildSnapshotContext({ ...input, maxContextChars });
+			const cutoff = candidate.context.lastIndexOf(`\n\n[snapshot truncated to ${maxContextChars} chars]`);
+			if (cutoff > activeStart && cutoff < activeStart + "## Active plan".length) {
+				cut = candidate;
+				break;
+			}
+		}
+
+		assert.ok(cut, "expected a bound that cuts the actual active-plan header");
+		assert.equal(cut.metadata.find((item) => item.category === "question")?.status, "included");
+		assert.equal(cut.metadata.find((item) => item.category === "active-plan")?.status, "truncated");
+	});
+
+	it("marks cuts through section headers, provenance labels, and content structurally", () => {
+		const input = {
+			question: "Review this snapshot.",
+			categories: [
+				{
+					category: "active-plan" as const,
+					title: "Active plan",
+					content: "Content payload that must remain distinguishable.",
+					sourceKind: "custom-entry" as const,
+					sourceLabel: "plan",
+				},
+			],
+		};
+		const complete = buildSnapshotContext({ ...input, maxContextChars: 2_000 });
+		const targets = [
+			complete.context.indexOf("## Active plan") + 2,
+			complete.context.indexOf("[snapshot:active-plan") + 2,
+			complete.context.indexOf("Content payload") + 2,
+		];
+
+		for (const target of targets) {
+			let cut: ReturnType<typeof buildSnapshotContext> | undefined;
+			for (let maxContextChars = 120; maxContextChars <= 900; maxContextChars += 1) {
+				const candidate = buildSnapshotContext({ ...input, maxContextChars });
+				const cutoff = candidate.context.lastIndexOf(`\n\n[snapshot truncated to ${maxContextChars} chars]`);
+				if (cutoff > target && cutoff <= target + 8) {
+					cut = candidate;
+					break;
+				}
+			}
+			assert.ok(cut, `expected a bound near snapshot offset ${target}`);
+			assert.equal(cut.metadata.find((item) => item.category === "active-plan")?.status, "truncated");
+		}
+	});
 });
 
 describe("runtime snapshot collection seam", () => {
@@ -928,6 +1048,88 @@ describe("pitaj M3-B2 usage accounting", () => {
 		const text = recorder.renderSummary();
 		assert.match(text, /errors: 1/);
 		assert.match(text, /context source:\n  snapshot: 1/);
+	});
+
+
+	it("retains effective facts on failed default, alias, and auto-route events", () => {
+		const recorder = createUsageRecorder();
+		const cases = [
+			{
+				requestedModel: undefined,
+				resolvedModel: "anthropic/claude-opus-4-8",
+				resolvedAlias: "opus",
+				mode: "answer",
+				brevity: "short",
+				risk: "high" as const,
+				autoRouted: false,
+			},
+			{
+				requestedModel: "opus",
+				resolvedModel: "anthropic/claude-opus-4-8",
+				resolvedAlias: "opus",
+				mode: "critique",
+				brevity: "detailed",
+				risk: "high" as const,
+				autoRouted: false,
+			},
+			{
+				requestedModel: "auto",
+				resolvedModel: "openai-codex/gpt-5.5",
+				resolvedAlias: "gpt",
+				mode: "answer",
+				brevity: "short",
+				risk: "low" as const,
+				autoRouted: true,
+			},
+			{
+				requestedModel: "auto",
+				resolvedModel: "anthropic/claude-opus-4-8",
+				resolvedAlias: "opus",
+				mode: "risk-check",
+				brevity: "short",
+				risk: "high" as const,
+				autoRouted: true,
+			},
+			{
+				requestedModel: "auto",
+				resolvedModel: "anthropic/claude-opus-4-8",
+				resolvedAlias: "opus",
+				mode: "risk-check",
+				brevity: "short",
+				risk: "high" as const,
+				autoRouted: true,
+			},
+		];
+
+		for (const input of cases) {
+			recorder.recordFromRequest({
+				...input,
+				contextChars: 0,
+				hasSnapshot: false,
+				maxOutputChars: 2000,
+				success: false,
+			});
+			const event = recorder.snapshot().events.at(-1);
+			assert.ok(event);
+			assert.equal(event.requestedModel, input.requestedModel ?? "");
+			assert.equal(event.resolvedModel, input.resolvedModel);
+			assert.equal(event.resolvedAlias, input.resolvedAlias);
+			assert.equal(event.mode, input.mode);
+			assert.equal(event.brevity, input.brevity);
+			assert.equal(event.autoRouted, input.autoRouted);
+			assert.equal(event.risk, input.risk);
+			assert.equal(event.routeKind, "error");
+			assert.equal(event.success, false);
+		}
+
+		assert.deepEqual(recorder.snapshot().totals, {
+			lowRisk: 0,
+			highRisk: 0,
+			snapshot: 0,
+			lowRiskWarned: false,
+			highRiskWarned: false,
+			snapshotWarned: false,
+		});
 	});
 
 	it("flags low-risk warning at threshold 3", () => {

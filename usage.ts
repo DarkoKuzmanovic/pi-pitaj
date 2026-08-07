@@ -29,7 +29,7 @@ export interface UsageRecorder {
 	}) => void;
 	renderSummary: () => string;
 	reset: () => void;
-	snapshot: () => { totals: UsageBudgetState };
+	snapshot: () => { totals: UsageBudgetState; events: readonly UsageEvent[] };
 }
 
 export function createUsageRecorder(): UsageRecorder {
@@ -53,16 +53,21 @@ export function createUsageRecorder(): UsageRecorder {
 			hasSnapshot: input.hasSnapshot,
 			contextChars: input.contextChars,
 		});
-		const { routeKind, risk } = classifyUsageEvent({
+		const classificationInput = {
 			requestedModel: input.requestedModel,
 			resolvedModel: input.resolvedModel,
 			resolvedAlias: input.resolvedAlias,
 			autoRouted: input.autoRouted,
 			risk: input.risk,
 			mode: input.mode,
-			success: input.success,
 			contextSource,
-		});
+		};
+		const classification = classifyUsageEvent({ ...classificationInput, success: input.success });
+		// A failed event remains an error route, but its risk still describes the
+		// effective resolved route rather than being replaced by the error sentinel.
+		const effectiveClassification = input.success
+			? classification
+			: classifyUsageEvent({ ...classificationInput, success: true });
 
 		const event: UsageEvent = {
 			timestamp: Date.now(),
@@ -70,10 +75,10 @@ export function createUsageRecorder(): UsageRecorder {
 			resolvedModel: input.resolvedModel,
 			...(input.resolvedAlias ? { resolvedAlias: input.resolvedAlias } : {}),
 			autoRouted: input.autoRouted,
-			routeKind,
+			routeKind: classification.routeKind,
 			mode: input.mode,
 			brevity: input.brevity,
-			risk,
+			risk: effectiveClassification.risk,
 			contextSource,
 			contextChars: input.contextChars,
 			maxOutputChars: input.maxOutputChars,
@@ -90,8 +95,9 @@ export function createUsageRecorder(): UsageRecorder {
 		return formatUsageSummaryText(summary);
 	}
 
-	function snapshot(): { totals: UsageBudgetState } {
-		return { totals: store.snapshot().totals };
+	function snapshot(): { totals: UsageBudgetState; events: readonly UsageEvent[] } {
+		const snap = store.snapshot();
+		return { totals: snap.totals, events: snap.events };
 	}
 
 	function reset(): void {

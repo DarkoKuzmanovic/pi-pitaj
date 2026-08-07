@@ -59,6 +59,23 @@ interface SnapshotSection {
 	status: "included" | "truncated";
 }
 
+interface SnapshotSectionRange {
+	category: SnapshotCategory;
+	start: number;
+	end: number;
+}
+
+interface RenderedSnapshot {
+	context: string;
+	sectionRanges: readonly SnapshotSectionRange[];
+}
+
+interface BoundedSnapshot {
+	context: string;
+	cutoff: number;
+	truncated: boolean;
+}
+
 export const SNAPSHOT_CATEGORY_ORDER: readonly SnapshotCategory[] = [
 	"question",
 	"recent-user-request",
@@ -118,15 +135,15 @@ export function buildSnapshotContext(input: SnapshotBuildInput): SnapshotBuildRe
 	const initialMetadata = buildMetadata(sections, input.categories);
 	const hasCategoryTruncation = sections.some((section) => section.status === "truncated");
 	const rendered = renderSections(sections, hasCategoryTruncation);
-	const bounded = enforceMaxContextChars(rendered, maxContextChars);
-	const metadata = markWholeSnapshotTruncation(initialMetadata, sections, bounded);
+	const bounded = enforceMaxContextChars(rendered.context, maxContextChars);
+	const metadata = markWholeSnapshotTruncation(initialMetadata, rendered.sectionRanges, bounded.cutoff);
 	const omittedCategories = metadata
 		.filter((item) => item.status === "omitted")
 		.map((item) => item.category);
-	const truncated = hasCategoryTruncation || bounded.length < rendered.length;
+	const truncated = hasCategoryTruncation || bounded.truncated;
 
 	return {
-		context: bounded,
+		context: bounded.context,
 		metadata,
 		omittedCategories,
 		truncated,
@@ -226,35 +243,51 @@ function buildMetadata(
 
 function markWholeSnapshotTruncation(
 	metadata: readonly SnapshotCategoryMetadata[],
-	sections: readonly SnapshotSection[],
-	context: string,
+	sectionRanges: readonly SnapshotSectionRange[],
+	cutoff: number,
 ): SnapshotCategoryMetadata[] {
 	return metadata.map((item) => {
-		if (item.status !== "included") {
+		if (item.status === "omitted") {
 			return item;
 		}
 
-		const section = sections.find((candidate) => candidate.category === item.category);
-		if (!section || context.includes(renderSection(section))) {
-			return item;
+		const range = sectionRanges.find((candidate) => candidate.category === item.category);
+		if (!range || range.start >= cutoff) {
+			const { truncated: _truncated, ...withoutTruncation } = item;
+			return {
+				...withoutTruncation,
+				status: "omitted",
+				omissionReason: "Omitted by maxContextChars bound.",
+			};
 		}
 
-		return {
-			...item,
-			status: "truncated",
-			truncated: true,
-		};
+		if (range.end > cutoff) {
+			return {
+				...item,
+				status: "truncated",
+				truncated: true,
+			};
+		}
+
+		return item;
 	});
 }
 
-function renderSections(sections: readonly SnapshotSection[], includeTruncationMarker: boolean): string {
-	const renderedSections = sections.map((section) => renderSection(section));
-	const context = [SNAPSHOT_HEADER, ...renderedSections].join("\n\n");
-	if (!includeTruncationMarker) {
-		return context;
+function renderSections(sections: readonly SnapshotSection[], includeTruncationMarker: boolean): RenderedSnapshot {
+	let context = SNAPSHOT_HEADER;
+	const sectionRanges: SnapshotSectionRange[] = [];
+	for (const section of sections) {
+		const renderedSection = renderSection(section);
+		const start = context.length + 2;
+		context += `\n\n${renderedSection}`;
+		sectionRanges.push({ category: section.category, start, end: context.length });
 	}
 
-	return `${context}\n\n[snapshot truncated: one or more categories were shortened before consultation]`;
+	if (includeTruncationMarker) {
+		context += "\n\n[snapshot truncated: one or more categories were shortened before consultation]";
+	}
+
+	return { context, sectionRanges };
 }
 
 function renderSection(section: SnapshotSection): string {
@@ -270,17 +303,22 @@ function categoryContentLimit(maxContextChars: number): number {
 	return Math.max(80, Math.floor(maxContextChars * 0.45));
 }
 
-function enforceMaxContextChars(context: string, maxContextChars: number): string {
+function enforceMaxContextChars(context: string, maxContextChars: number): BoundedSnapshot {
 	if (context.length <= maxContextChars) {
-		return context;
+		return { context, cutoff: context.length, truncated: false };
 	}
 
 	const marker = `\n\n[snapshot truncated to ${maxContextChars} chars]`;
 	if (maxContextChars <= marker.length) {
-		return marker.slice(0, maxContextChars);
+		return { context: marker.slice(0, maxContextChars), cutoff: 0, truncated: true };
 	}
 
-	return `${context.slice(0, maxContextChars - marker.length).trimEnd()}${marker}`;
+	const cutoff = maxContextChars - marker.length;
+	return {
+		context: `${context.slice(0, cutoff).trimEnd()}${marker}`,
+		cutoff,
+		truncated: true,
+	};
 }
 
 function normalizeMaxContextChars(maxContextChars: number): number {
