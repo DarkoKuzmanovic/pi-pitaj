@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rename, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rename, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import type { stream } from "@earendil-works/pi-ai";
+import type { PitajStreamSimple } from "./index.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { mergeSettings } from "./helpers.ts";
 import pitaj, { consultModel } from "./index.ts";
@@ -13,6 +13,7 @@ import {
 	PITAJ_EVIDENCE_TOOL,
 	PITAJ_EVIDENCE_TOOL_NAME,
 	approveOracleRoot,
+	buildHardenedGitEnvironment,
 	executeOracleEvidence,
 } from "./oracle.ts";
 import {
@@ -92,10 +93,102 @@ describe("Oracle host evidence adapter", () => {
 		}
 	});
 
+	it("strips inherited Git variables case-insensitively for Windows environment semantics", () => {
+		// Windows environment lookup is case-insensitive, so `git_dir` and
+		// `Git_Config_Global` select a repository or config exactly like the
+		// uppercase spelling would.
+		const environment = buildHardenedGitEnvironment({
+			PATH: "/usr/bin",
+			GIT_DIR: "/elsewhere/.git",
+			git_dir: "/elsewhere/.git",
+			Git_Work_Tree: "/elsewhere",
+			gIt_ExTeRnAl_DiFf: "/tmp/hostile",
+			git_config_count: "1",
+			GITHUB_TOKEN: "kept-not-a-git-variable",
+			DIGIT_COUNT: "kept-not-a-git-variable",
+		});
+
+		for (const name of Object.keys(environment)) {
+			assert.ok(
+				!name.toUpperCase().startsWith("GIT_") || name === name.toUpperCase(),
+				`inherited Git variable survived: ${name}`,
+			);
+		}
+		assert.equal(environment.git_dir, undefined);
+		assert.equal(environment.Git_Work_Tree, undefined);
+		assert.equal(environment.gIt_ExTeRnAl_DiFf, undefined);
+		assert.equal(environment.git_config_count, undefined);
+		assert.equal(environment.GIT_DIR, undefined);
+		assert.equal(environment.PATH, "/usr/bin");
+		assert.equal(environment.GITHUB_TOKEN, "kept-not-a-git-variable");
+		assert.equal(environment.DIGIT_COUNT, "kept-not-a-git-variable");
+		// Only the values pitaj sets itself are added back.
+		assert.equal(environment.GIT_CONFIG_NOSYSTEM, "1");
+		assert.equal(environment.GIT_OPTIONAL_LOCKS, "0");
+		assert.equal(environment.GIT_TERMINAL_PROMPT, "0");
+		assert.equal(environment.LC_ALL, "C");
+	});
+
 	it("rejects an approved root when the active working directory is not in a repository", async () => {
 		const root = await makeRepository();
 		const outside = await mkdtemp(join(tmpdir(), "pi-pitaj-norepo-"));
 		await assert.rejects(approveOracleRoot(root, outside), /workspace/);
+	});
+
+	async function makeFsmonitorHook(): Promise<{ hookPath: string; markerPath: string; configPath: string }> {
+		const directory = await mkdtemp(join(tmpdir(), "pi-pitaj-fsmonitor-"));
+		const markerPath = join(directory, "fsmonitor-fired.txt");
+		const hookPath = join(directory, "hook.sh");
+		await writeFile(hookPath, `#!/bin/sh\nprintf fired >> ${JSON.stringify(markerPath)}\nexit 1\n`, { mode: 0o755 });
+		const configPath = join(directory, "injected.gitconfig");
+		await writeFile(configPath, `[core]\n\tfsmonitor = ${JSON.stringify(hookPath)}\n`);
+		return { hookPath, markerPath, configPath };
+	}
+
+	async function fsmonitorFired(markerPath: string): Promise<boolean> {
+		try {
+			await stat(markerPath);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	async function runEveryOracleGitPath(root: string): Promise<void> {
+		await approveOracleRoot(root, root);
+		await evidence(root, { operation: "search", pattern: "needle" });
+		await evidence(root, { operation: "git_diff" });
+	}
+
+	it("never executes an environment-injected Git config hook for search, diff, or root calls", async () => {
+		const root = await makeRepository();
+		await writeFile(join(root, "source.ts"), "export const answer = 43;\n");
+		const { markerPath, configPath } = await makeFsmonitorHook();
+		const previous = new Map<string, string | undefined>([
+			["GIT_CONFIG_GLOBAL", process.env.GIT_CONFIG_GLOBAL],
+			["GIT_CONFIG_SYSTEM", process.env.GIT_CONFIG_SYSTEM],
+		]);
+		try {
+			process.env.GIT_CONFIG_GLOBAL = configPath;
+			process.env.GIT_CONFIG_SYSTEM = configPath;
+			await runEveryOracleGitPath(root);
+			assert.equal(await fsmonitorFired(markerPath), false, "injected Git config must never execute a program");
+		} finally {
+			for (const [name, value] of previous) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+		}
+	});
+
+	it("never executes a repository-local fsmonitor hook for search, diff, or root calls", async () => {
+		const root = await makeRepository();
+		await writeFile(join(root, "source.ts"), "export const answer = 44;\n");
+		const { hookPath, markerPath } = await makeFsmonitorHook();
+		await execGit(root, ["config", "--local", "core.fsmonitor", hookPath]);
+
+		await runEveryOracleGitPath(root);
+		assert.equal(await fsmonitorFired(markerPath), false, "repository-local config must never execute a program");
 	});
 
 	it("defines exactly one virtual evidence tool with bounded arguments", () => {
@@ -126,6 +219,17 @@ describe("Oracle host evidence adapter", () => {
 		const denied = await evidence(root, { operation: "read_file", path: ".env" });
 		assert.equal(denied.isError, true);
 		assert.doesNotMatch(denied.content, /do-not-show/);
+	});
+
+
+	it("reads a POSIX filename containing a backslash without treating it as a separator", { skip: process.platform === "win32" }, async () => {
+		const root = await makeRepository();
+		const filename = "literal\\name.ts";
+		await writeFile(join(root, filename), "export const backslashName = true;\n");
+
+		const result = await evidence(root, { operation: "read_file", path: filename });
+		assert.equal(result.isError, false);
+		assert.match(result.content, /backslashName = true/);
 	});
 
 	it("rejects symlink escapes, symlink leaves, directories, and oversized files", async () => {
@@ -335,7 +439,7 @@ type StreamStep = {
 	usage?: StreamUsage;
 };
 
-function streamSequence(steps: StreamStep[], calls: unknown[][]): typeof stream {
+function streamSequence(steps: StreamStep[], calls: unknown[][]): PitajStreamSimple {
 	let index = 0;
 	return ((...args: unknown[]) => {
 		calls.push(args);
@@ -366,7 +470,7 @@ function streamSequence(steps: StreamStep[], calls: unknown[][]): typeof stream 
 				};
 			},
 		};
-	}) as unknown as typeof stream;
+	}) as unknown as PitajStreamSimple;
 }
 
 function usageFor(input: number, output: number): StreamUsage {
@@ -543,6 +647,119 @@ describe("Oracle serial consult loop", () => {
 			/oracleRoot/,
 		);
 		assert.equal(calls.length, 0);
+	});
+
+	it("never calls result(), aggregates usage, or runs another Oracle round after the iterator throws", async () => {
+		const root = await makeRepository();
+		let resultCalls = 0;
+		let rounds = 0;
+		const throwingOracleStream = (() => {
+			rounds += 1;
+			return {
+				async *[Symbol.asyncIterator]() {
+					yield { type: "text_delta", delta: "12345" };
+					throw new Error("socket closed");
+				},
+				async result() {
+					resultCalls += 1;
+					return {
+						role: "assistant",
+						content: [
+							{
+								type: "toolCall",
+								id: "call-1",
+								name: PITAJ_EVIDENCE_TOOL_NAME,
+								arguments: { operation: "read_file", path: "source.ts" },
+							},
+						],
+						stopReason: "toolUse",
+						usage: usageFor(11, 11),
+					};
+				},
+			};
+		}) as unknown as PitajStreamSimple;
+
+		await assert.rejects(
+			consultModel(
+				{ question: "q", model: "opus", mode: "oracle", oracleRoot: root },
+				fakeContext([], root),
+				undefined,
+				LOADED,
+				undefined,
+				throwingOracleStream,
+			),
+			(error: unknown) => {
+				assert.equal((error as { usage?: unknown }).usage, undefined);
+				assert.equal((error as { details?: { evidence?: unknown } }).details?.evidence, undefined);
+				return /failed mid-stream: socket closed \(received 5 chars of partial text before failure\)/.test(String(error));
+			},
+		);
+		assert.equal(resultCalls, 0, "result() must never be awaited after the iterator threw");
+		assert.equal(rounds, 1, "a thrown iterator must not start another Oracle round");
+	});
+
+	it("treats a rejected result() as terminal for an Oracle round", async () => {
+		const root = await makeRepository();
+		let rounds = 0;
+		const rejectingOracleStream = (() => {
+			rounds += 1;
+			return {
+				async *[Symbol.asyncIterator]() {
+					yield { type: "text_delta", delta: "1234567890" };
+				},
+				async result() {
+					throw new Error("result unavailable");
+				},
+			};
+		}) as unknown as PitajStreamSimple;
+
+		await assert.rejects(
+			consultModel(
+				{ question: "q", model: "opus", mode: "oracle", oracleRoot: root },
+				fakeContext([], root),
+				undefined,
+				LOADED,
+				undefined,
+				rejectingOracleStream,
+			),
+			(error: unknown) => {
+				assert.equal((error as { usage?: unknown }).usage, undefined);
+				return /failed mid-stream: result unavailable \(received 10 chars of partial text before failure\)/.test(String(error));
+			},
+		);
+		assert.equal(rounds, 1, "a rejected terminal result must not start another Oracle round");
+	});
+
+	it("does not aggregate usage from a malformed toolUse round that names no tool call", async () => {
+		const root = await makeRepository();
+		const malformedStream = (() => ({
+			async *[Symbol.asyncIterator]() {
+				yield { type: "text_delta", delta: "thinking" };
+			},
+			async result() {
+				return {
+					role: "assistant",
+					content: [{ type: "text", text: "thinking" }],
+					stopReason: "toolUse",
+					usage: usageFor(13, 13),
+				};
+			},
+		})) as unknown as PitajStreamSimple;
+
+		await assert.rejects(
+			consultModel(
+				{ question: "q", model: "opus", mode: "oracle", oracleRoot: root },
+				fakeContext([], root),
+				undefined,
+				LOADED,
+				undefined,
+				malformedStream,
+			),
+			(error: unknown) => {
+				assert.equal((error as { usage?: unknown }).usage, undefined);
+				return /requested evidence without a tool call/.test(String(error));
+			},
+		);
 	});
 
 	it("rejects a Git repository outside the active workspace before starting a stream", async () => {

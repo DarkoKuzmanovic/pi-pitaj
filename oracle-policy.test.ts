@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { posix, win32 } from "node:path";
 import { describe, it } from "node:test";
 import {
 	ORACLE_DENIED_SEGMENTS,
@@ -18,6 +19,9 @@ import {
 	isDeniedSegment,
 	parseHostActionMarker,
 	resolveRootRelativePath,
+	relativeRootPath,
+	isPathWithinRoot,
+	selectPathApi,
 	scanForSecrets,
 	truncateEvidenceResult,
 	validateOracleRequest,
@@ -428,6 +432,51 @@ describe("root-relative path validation", () => {
 		assert.equal(result.ok, true);
 	});
 });
+
+
+	describe("portable path flavor", () => {
+		it("normalizes Win32 drive paths and rejects drive escapes", () => {
+			const inside = resolveRootRelativePath("C:\\work\\repo", "src\\index.ts");
+			assert.deepEqual(inside, { ok: true, resolved: "C:\\work\\repo\\src\\index.ts" });
+			assert.equal(resolveRootRelativePath("C:\\work\\repo", "..\\other\\x.ts").ok, false);
+			assert.equal(resolveRootRelativePath("C:\\work\\repo", "D:\\other\\x.ts").ok, false);
+		});
+
+		it("uses component-aware containment rather than string prefixes", () => {
+			assert.equal(isPathWithinRoot("C:\\work\\repo", "C:\\work\\repo\\src\\x.ts"), true);
+			assert.equal(isPathWithinRoot("C:\\work\\repo", "C:\\work\\repository\\x.ts"), false);
+			assert.equal(relativeRootPath("/repo", "/repo/src/x.ts"), "src/x.ts");
+			assert.equal(relativeRootPath("/repo", "/repository/x.ts"), undefined);
+		});
+
+		it("selects the flavor from the host and the root, never from the candidate", () => {
+			const posixHost = { posix, win32, host: posix };
+			const windowsHost = { posix, win32, host: win32 };
+
+			assert.equal(selectPathApi("/repo", posixHost), posix);
+			assert.equal(selectPathApi("/repo/nested", posixHost), posix);
+			// A Win32 host resolves every root with Win32 semantics.
+			assert.equal(selectPathApi("/repo", windowsHost), win32);
+			// A drive-letter or UNC root is Win32 on any host.
+			assert.equal(selectPathApi("C:\\work\\repo", posixHost), win32);
+			assert.equal(selectPathApi("\\\\server\\share\\repo", posixHost), win32);
+		});
+
+		it("keeps a POSIX root POSIX when a candidate contains a backslash", () => {
+			assert.deepEqual(resolveRootRelativePath("/repo", "we\\ird.txt"), { ok: true, resolved: "/repo/we\\ird.txt" });
+			assert.equal(relativeRootPath("/repo", "/repo/we\\ird.txt"), "we\\ird.txt");
+			assert.equal(isPathWithinRoot("/repo", "/repo/we\\ird.txt"), true);
+		});
+
+		it("resolves Win32 roots the same way on a POSIX host fixture", () => {
+			const posixHost = { posix, win32, host: posix };
+			const api = selectPathApi("C:\\work\\repo", posixHost);
+			assert.equal(api.resolve("C:\\work\\repo", "src\\x.ts"), "C:\\work\\repo\\src\\x.ts");
+			assert.equal(relativeRootPath("C:\\work\\repo", "C:\\work\\repo\\src\\x.ts", false, posixHost), "src\\x.ts");
+			assert.equal(relativeRootPath("C:\\work\\repo", "C:\\work\\other\\x.ts", false, posixHost), undefined);
+			assert.equal(resolveRootRelativePath("C:\\work\\repo", "..\\other\\x.ts", posixHost).ok, false);
+		});
+	});
 
 // ---------------------------------------------------------------------------
 // Additive schema / mode compatibility

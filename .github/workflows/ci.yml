@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["24.x"]
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+        with:
+          # Full history: a push can carry many commits, and the whitespace
+          # check below diffs from the pushed-from commit, not from HEAD^.
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install exact dependencies
+        run: npm ci --include=dev --ignore-scripts
+
+      - name: Typecheck and test
+        run: npm run check
+
+      - name: Check changed-line whitespace
+        shell: bash
+        env:
+          # Interpolated into the environment, never into the script body.
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base="$PR_BASE_SHA"
+          else
+            base="$PUSH_BEFORE_SHA"
+          fi
+          # A new branch or a force-push reports an all-zero (or empty) before
+          # SHA, and a rewritten history may name a commit this checkout does
+          # not have. Fall back to the parent, then to the empty tree.
+          if [[ -z "$base" || "$base" =~ ^0+$ ]] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-parse "${HEAD_SHA}^" 2>/dev/null || git hash-object -t tree /dev/null)"
+          fi
+          echo "Checking whitespace on $base..$HEAD_SHA"
+          git diff --check "$base" "$HEAD_SHA"
+
+      - name: Verify package inventory
+        run: npm pack --dry-run --json --ignore-scripts

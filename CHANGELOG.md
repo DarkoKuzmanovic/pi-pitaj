@@ -5,6 +5,27 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+
+## [0.3.1] — 2026-08-07
+
+### Fixed
+
+- Migrated consultation streaming to the active Pi 0.84.1 public boundary: provider lookup uses `ctx.modelRegistry.getProvider(model.provider)?.streamSimple`, auth uses `getApiKeyAndHeaders(model)`, keyless `ok: true` providers are accepted, optional `apiKey`/`headers` are forwarded conditionally, and missing providers fail loudly. `/pitaj check` validates the same provider/stream/auth path.
+- Made corrupt or protocol-invalid rounds terminal. Iterator and `result()` rejection cannot return partial answers, trigger Oracle evidence, persist messages, or contribute usage; unexpected `toolUse` in an ordinary or tools-disabled round is rejected before usage acceptance. Accepted completed rounds alone contribute nested provider usage, and partial diagnostics report only bounded character counts. Ordinary and Oracle rounds request 2,048/4,096/8,192 output tokens by brevity.
+- Added conservative automatic snapshot secret refusal before ring-buffer retention for recent tool results and bounded recent-user captures. Complete multipart text, secret tails, and every top-level generic result string are classified before a bounded summary is selected. Explicit question/context remains caller-selected and unscanned. The fixed omission marker discloses no detector, secret, or line.
+- Replaced command parsing with one quote-aware lexer covering JavaScript whitespace, escaped quotes/backslashes, quoted syntax provenance, duplicate flags, deterministic unbalanced-quote fallback, and quote-aware advise/special-command classification.
+- Enforced finite integer character bounds: `maxContextChars` 1..64,000 and `maxOutputChars` 1..16,000 across TypeBox, settings parsing/UI, snapshot/runtime collection, and direct consultation calls. Persisted invalid values warn and fall back.
+- Added portable POSIX/Win32 root containment checks and hardened every Oracle Git subprocess by removing inherited `GIT_*` variables, isolating system/global config, disabling optional locks/fsmonitor, and preserving only the documented residual trust in `PATH`/the Git executable.
+- Added `settings-persistence.ts`: raw-document field patching preserves unknown root fields/raw aliases; malformed, symlink, and non-regular sources are refused; source identity/hash/content witnesses detect absent/create/edit/remove and same-content inode replacement; a fixed exclusive same-directory temp is written, fsynced, atomically renamed, directory-fsynced best-effort, and cleaned on pre-rename failure. Conflicts are never retried and settings remain package-local with no migration.
+- Config persistence now validates the complete patched raw document: unknown fields remain preserved, while an invalid known setting is refused instead of being silently carried through an unrelated UI edit. Default/alias model references must resolve, normalized alias collisions are rejected, and `auto`/`advise` remain reserved alias names.
+- Corrected platform-specific path traversal so a POSIX backslash filename is checked and opened as the same path, made category truncation counts exact when retained prefixes end in whitespace, and included bounded provider detail plus partial size in declared-abort diagnostics.
+
+### Packaging and documentation
+
+- Pinned active development dependencies to Pi 0.84.1, TypeScript 5.9.3, Node types 24.13.3, and typebox 1.3.7 while retaining wildcard peer dependencies. Added the Node 24 engine, package files allowlist, and CI workflow with `npm ci --include=dev --ignore-scripts`, `npm run check`, meaningful-range `git diff --check`, and JSON pack inventory.
+- Reconciled README/AGENTS/DECISIONS with ambient-versus-explicit snapshot policy, token-versus-answer-character caps, active provider streaming/auth behavior, atomic settings semantics, residual trust, install/rollback, and the Node 24 gate.
+- Explicitly deferred P2.4, P2.6, O1, O2, and O3. O4 is display-scope documentation only; no O4 code changes are included.
+
 ## [0.3.0] — 2026-08-07
 
 ### Changed

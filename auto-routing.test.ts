@@ -140,6 +140,47 @@ describe("pitaj auto routing", () => {
 		}
 	});
 
+	it("reports a duplicate flag as a notification before starting any consult", async () => {
+		for (const [args, expected] of [
+			["opus --mode debug --mode plan which?", /--mode was given more than once/],
+			["snapshot -c one --context two which?", /--context was given more than once/],
+			["--brevity short -b detailed which?", /--brevity was given more than once/],
+		] as const) {
+			const notifications: string[] = [];
+			let handler: ((commandArgs: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
+			const api = {
+				on() {},
+				registerTool() {},
+				registerCommand(_name: string, options: { handler: typeof handler }) {
+					handler = options.handler;
+				},
+			} as unknown as ExtensionAPI;
+			pitaj(api);
+			if (!handler) throw new Error("pitaj did not register its command");
+
+			const ctx = {
+				hasUI: false,
+				ui: {
+					notify(message: string) {
+						notifications.push(message);
+					},
+					setStatus() {},
+				},
+				modelRegistry: {
+					find() {
+						throw new Error("no consult may start for a duplicate flag");
+					},
+				},
+			} as unknown as ExtensionCommandContext;
+
+			await handler(args, ctx);
+			assert.ok(
+				notifications.some((message) => expected.test(message)),
+				`expected ${expected} in ${JSON.stringify(notifications)}`,
+			);
+		}
+	});
+
 	it("keeps manual model resolution separate from auto routing hints", () => {
 		const settings = mergeSettings();
 		assert.deepEqual([...PITAJ_AUTO_RISKS], ["low", "high"]);

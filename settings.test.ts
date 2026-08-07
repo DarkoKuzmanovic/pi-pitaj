@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import {
 	BREVITY_OUTPUT_CHARS,
 	CONFIG_EDITABLE_FIELDS,
 	PITAJ_DEFAULT_MODES,
 	PITAJ_MODES,
 	applyConfigUpdate,
+	detectConcurrentSettingsChange,
 	formatConfigSummaryText,
 	formatResultForDisplay,
 	formatSettingsChangeSummary,
@@ -21,11 +25,14 @@ import {
 	settingsFromUnknown,
 	summarizeSettings,
 	warnInvalidPersistedDefaultMode,
+	warnInvalidPersistedCharacterLimits,
 } from "./helpers.ts";
-import { promptConfigValue } from "./index.ts";
+import { loadSettings, promptConfigValue, writeSettingsFileAtomically } from "./index.ts";
 import { createUsageRecorder } from "./usage.ts";
 
-const SETTINGS_PATH = "/home/quzma/.pi/agent/extensions/pi-pitaj/settings.json";
+// Derived from this test module's own location: the suite must not depend on
+// any particular checkout directory.
+const SETTINGS_PATH = fileURLToPath(new URL("./settings.json", import.meta.url));
 
 describe("pitaj settings and model aliases", () => {
 	it("resolves shorthand aliases case-insensitively", () => {
@@ -309,6 +316,66 @@ describe("pitaj M2 config summary and validation helpers", () => {
 	});
 });
 
+describe("settings write compare-and-swap and atomicity", () => {
+	function makeSettingsDirectory(initial?: string): string {
+		const directory = mkdtempSync(join(tmpdir(), "pi-pitaj-settings-"));
+		if (initial !== undefined) writeFileSync(join(directory, "settings.json"), initial, "utf8");
+		return directory;
+	}
+
+	it("detects no change when the file is byte-identical to the witness", () => {
+		const raw = '{"defaultModel":"opus"}\n';
+		assert.equal(detectConcurrentSettingsChange({ exists: true, content: raw }, { exists: true, content: raw }), undefined);
+		assert.equal(detectConcurrentSettingsChange({ exists: false }, { exists: false }), undefined);
+	});
+
+	it("detects a concurrent modification, creation, and deletion", () => {
+		const modified = detectConcurrentSettingsChange({ exists: true, content: "a" }, { exists: true, content: "b" });
+		assert.match(modified ?? "", /changed on disk/);
+		assert.match(detectConcurrentSettingsChange({ exists: false }, { exists: true, content: "a" }) ?? "", /created/);
+		assert.match(detectConcurrentSettingsChange({ exists: true, content: "a" }, { exists: false }) ?? "", /removed/);
+	});
+
+	it("refuses the write and leaves the on-disk file untouched when it changed since it was read", () => {
+		const directory = makeSettingsDirectory('{"defaultModel":"opus"}\n');
+		const path = join(directory, "settings.json");
+		const witness = { exists: true, content: '{"defaultModel":"opus"}\n' };
+		writeFileSync(path, '{"defaultModel":"gpt"}\n', "utf8");
+
+		assert.throws(() => writeSettingsFileAtomically(path, witness, '{"defaultModel":"glm"}\n'), /changed on disk/);
+		assert.equal(readFileSync(path, "utf8"), '{"defaultModel":"gpt"}\n');
+		assert.deepEqual(readdirSync(directory), ["settings.json"]);
+	});
+
+	it("replaces the settings file in place and leaves no temporary file behind", () => {
+		const directory = makeSettingsDirectory('{"defaultModel":"opus"}\n');
+		const path = join(directory, "settings.json");
+
+		writeSettingsFileAtomically(path, { exists: true, content: '{"defaultModel":"opus"}\n' }, '{"defaultModel":"glm"}\n');
+
+		assert.equal(readFileSync(path, "utf8"), '{"defaultModel":"glm"}\n');
+		assert.deepEqual(readdirSync(directory), ["settings.json"]);
+	});
+
+	it("captures the exact on-disk bytes as the witness when loading settings", () => {
+		const loaded = loadSettings();
+		assert.equal(loaded.witness.exists, true);
+		assert.equal(loaded.witness.content, readFileSync(SETTINGS_PATH, "utf8"));
+		assert.equal(detectConcurrentSettingsChange(loaded.witness, loadSettings().witness), undefined);
+	});
+
+	it("creates a missing settings file and refuses when another writer created it first", () => {
+		const directory = makeSettingsDirectory();
+		const path = join(directory, "settings.json");
+
+		writeSettingsFileAtomically(path, { exists: false }, '{"defaultModel":"glm"}\n');
+		assert.equal(readFileSync(path, "utf8"), '{"defaultModel":"glm"}\n');
+
+		assert.throws(() => writeSettingsFileAtomically(path, { exists: false }, '{"defaultModel":"gpt"}\n'), /created/);
+		assert.equal(readFileSync(path, "utf8"), '{"defaultModel":"glm"}\n');
+		assert.deepEqual(readdirSync(directory), ["settings.json"]);
+	});
+});
 describe("interactive config update helpers", () => {
 	it("applies validated common setting updates without dropping aliases", () => {
 		const settings = mergeSettings({ aliases: { custom: "provider/model" } });
@@ -339,7 +406,7 @@ describe("interactive config update helpers", () => {
 		assert.equal(applyConfigUpdate(settings, "defaultBrevity", "detailed").defaultBrevity, "detailed");
 		assert.equal(applyConfigUpdate(settings, "maxContextChars", "1234").maxContextChars, 1234);
 		assert.equal(applyConfigUpdate(settings, "maxOutputChars", "").maxOutputChars, undefined);
-		assert.throws(() => applyConfigUpdate(settings, "maxOutputChars", "0"), /positive integer/);
+		assert.throws(() => applyConfigUpdate(settings, "maxOutputChars", "0"), /positive integer|finite whole/);
 	});
 
 	it("formats a concise changed-fields summary for confirmation", () => {
@@ -356,8 +423,8 @@ describe("interactive config update helpers", () => {
 		assert.match(indexSource, /ctx\.ui\.select\("pitaj config"/);
 		assert.match(indexSource, /ctx\.ui\.input\(`Enter \$\{field\}`/);
 		assert.match(indexSource, /ctx\.ui\.confirm\(\s*"Write pitaj settings\?"/);
-		assert.match(indexSource, /writeFileSync\(SETTINGS_PATH, serializeSettings\(updated\), "utf8"\)/);
-		assert.match(indexSource, /try \{\s*writeFileSync\(SETTINGS_PATH, serializeSettings\(updated\), "utf8"\);/s);
+		assert.match(indexSource, /patchAndWriteSettingsDocument\(SETTINGS_PATH, loaded\.document, field, updated\[field\]\)/);
+		assert.match(indexSource, /try \{[^}]*patchAndWriteSettingsDocument\(SETTINGS_PATH, loaded\.document, field, updated\[field\]\);/s);
 		assert.match(indexSource, /pitaj config save failed/);
 		assert.match(indexSource, /loaded\.fileState === "malformed"/);
 		assert.match(indexSource, /Alias editing is manual in M2/);
@@ -402,6 +469,17 @@ describe("pitaj default mode excludes oracle", () => {
 		assert.throws(() => applyConfigUpdate(settings, "defaultMode", "oracle"), /per-call/i);
 		assert.throws(() => applyConfigUpdate(settings, "defaultMode", "oracle"), /answer, critique, debug, plan, risk-check/);
 		assert.equal(applyConfigUpdate(settings, "defaultMode", "plan").defaultMode, "plan");
+	});
+
+	it("warns and falls back for persisted character caps outside the hard bounds", () => {
+		for (const value of [0, -1, 1.5, Number.POSITIVE_INFINITY, 64_001]) {
+			const parsed = settingsFromUnknown({ maxContextChars: value, maxOutputChars: value });
+			assert.equal(parsed.maxContextChars, undefined);
+			assert.equal(parsed.maxOutputChars, undefined);
+			const warning = warnInvalidPersistedCharacterLimits({ maxContextChars: value, maxOutputChars: value }) ?? "";
+			assert.match(warning, /invalid character limits/);
+		}
+		assert.equal(warnInvalidPersistedCharacterLimits({ maxContextChars: 64_000, maxOutputChars: 16_000 }), undefined);
 	});
 
 	it("never offers oracle in the interactive default-mode choices", async () => {

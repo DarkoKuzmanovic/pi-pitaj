@@ -184,13 +184,13 @@ function findCategoryInput(
 function makeSection(input: SnapshotCategoryInput & { maxContextChars: number }): SnapshotSection {
 	const content = input.content?.trim() ?? "";
 	const charCount = content.length;
-	const limit = categoryContentLimit(input.maxContextChars);
+	const limit = Math.min(categoryContentLimit(input.maxContextChars), input.maxContextChars);
 	if (charCount > limit) {
-		const omittedChars = charCount - limit;
+		const bounded = truncateSnapshotContent(content, limit, input.category);
 		return {
 			category: input.category,
 			title: input.title,
-			content: `${content.slice(0, limit).trimEnd()}\n\n[snapshot:${input.category} truncated ${omittedChars} chars]`,
+			content: bounded,
 			sourceKind: input.sourceKind,
 			sourceLabel: input.sourceLabel,
 			charCount,
@@ -207,6 +207,25 @@ function makeSection(input: SnapshotCategoryInput & { maxContextChars: number })
 		charCount,
 		status: "included",
 	};
+}
+
+function truncateSnapshotContent(content: string, cap: number, category: SnapshotCategory): string {
+	if (cap <= 0) return "";
+	const markerFor = (omitted: number): string => `\n\n[snapshot:${category} truncated ${omitted} chars]`;
+	const initialMarker = markerFor(content.length - cap);
+	if (initialMarker.length >= cap) return content.slice(0, cap);
+
+	let headLength = Math.max(0, cap - markerFor(content.length).length);
+	while (headLength < cap && headLength + 1 + markerFor(content.length - headLength - 1).length <= cap) {
+		headLength++;
+	}
+	while (headLength > 0) {
+		const retained = content.slice(0, headLength).trimEnd();
+		const marker = markerFor(content.length - retained.length);
+		if (retained.length > 0 && retained.length + marker.length <= cap) return `${retained}${marker}`;
+		headLength--;
+	}
+	return content.slice(0, cap);
 }
 
 function buildMetadata(
@@ -322,8 +341,8 @@ function enforceMaxContextChars(context: string, maxContextChars: number): Bound
 }
 
 function normalizeMaxContextChars(maxContextChars: number): number {
-	if (!Number.isFinite(maxContextChars) || maxContextChars < 1) {
-		return 1;
+	if (!Number.isFinite(maxContextChars) || !Number.isInteger(maxContextChars) || maxContextChars < 1 || maxContextChars > 64_000) {
+		throw new Error("maxContextChars must be a finite whole number between 1 and 64000.");
 	}
-	return Math.floor(maxContextChars);
+	return maxContextChars;
 }

@@ -1,7 +1,13 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { stream, StringEnum, type AssistantMessage, type Message, type ToolResultMessage } from "@earendil-works/pi-ai";
+import {
+	StringEnum,
+	type AssistantMessage,
+	type AssistantMessageEventStream,
+	type Message,
+	type Provider,
+	type ToolResultMessage,
+} from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -17,21 +23,24 @@ import {
 	planSettingsWrite,
 	parseAutoCommandArgs,
 	parseCommandArgs,
-	serializeSettings,
 	PITAJ_AUTO_RISKS,
 	PITAJ_BREVITIES,
 	PITAJ_DEFAULT_MODES,
 	PITAJ_MODES,
-	classifySpecialCommand,
+	PROVIDER_MAX_TOKENS,
+	isUnquotedKeyword,
+	parseSpecialCommand,
 	formatResultForDisplay,
 	buildInlineWarnings,
 	applyUsageWarningFlags,
 	resolveAutoRoute,
 	resolveMaxOutputChars,
+	validateCharLimit,
 	resolveModelRef,
 	settingsFromUnknown,
 	summarizeSettings,
 	warnInvalidPersistedDefaultMode,
+	warnInvalidPersistedCharacterLimits,
 	type PitajSettingsFileState,
 	type ConfigEditableField,
 	truncateText,
@@ -50,6 +59,13 @@ import { buildSnapshotContext, type SnapshotCategory, type SnapshotCategoryMetad
 import { createUsageRecorder } from "./usage.ts";
 import { PITAJ_EVIDENCE_TOOL, PITAJ_EVIDENCE_TOOL_NAME, approveOracleRoot, executeOracleEvidence } from "./oracle.ts";
 import {
+	patchAndWriteSettingsDocument,
+	readSettingsDocumentForLoad,
+	writeSettingsDocumentAtomically,
+	type SettingsDocument,
+	type SettingsFileWitness,
+} from "./settings-persistence.ts";
+import {
 	checkEvidenceBudget,
 	resolveEvidenceRequestLimit,
 	consumeEvidenceBudget,
@@ -63,10 +79,20 @@ import {
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const SETTINGS_PATH = join(EXTENSION_DIR, "settings.json");
 
-interface LoadedSettings {
+/** Effective settings a consult needs; carries no write-side state. */
+export interface LoadedSettings {
 	settings: PitajSettings;
 	warning?: string;
 	fileState: PitajSettingsFileState;
+}
+
+/**
+ * What `loadSettings` returns: effective settings plus the compare-and-swap
+ * witness of the settings.json bytes they were parsed from.
+ */
+export interface LoadedSettingsFile extends LoadedSettings {
+	witness: SettingsFileWitness;
+	document: SettingsDocument;
 }
 
 interface PitajRequest {
@@ -161,36 +187,72 @@ export interface SnapshotCommandRequestResult {
 interface SnapshotCommandRuntime {
 	sessionManager?: SnapshotRuntimeSessionManager;
 	toolResults?: SnapshotToolResultBuffer;
+	recentUserMaxChars?: number;
 }
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-function loadSettings(): LoadedSettings {
-	if (!existsSync(SETTINGS_PATH)) {
-		return withAutoRouteWarning({ settings: mergeSettings(), fileState: "not-found" });
+/**
+ * Backward-compatible test seam for the former writer API. The config command
+ * uses the richer parsed-document writer below; this wrapper compares the old
+ * content-only witness before delegating to the hardened persistence module.
+ */
+export function writeSettingsFileAtomically(path: string, witness: SettingsFileWitness, content: string): void {
+	const current = readSettingsDocumentForLoad(path);
+	if (witness.exists !== current.witness.exists || (witness.exists && witness.content !== current.rawText)) {
+		const state = witness.exists ? (current.witness.exists ? "changed" : "removed") : "created";
+		throw new Error(`settings.json was ${state} on disk since it was read`);
 	}
+	writeSettingsDocumentAtomically(path, current, content);
+}
 
+/**
+ * Read pitaj settings.json once, retaining the parsed root and source witness
+ * needed for safe, field-scoped config persistence.
+ */
+export function loadSettings(): LoadedSettingsFile {
+	let document: SettingsDocument;
 	try {
-		const parsed = JSON.parse(readFileSync(SETTINGS_PATH, "utf-8")) as unknown;
-		const defaultModeWarning = warnInvalidPersistedDefaultMode(parsed);
-		return withAutoRouteWarning({
-			settings: mergeSettings(settingsFromUnknown(parsed)),
-			fileState: "loaded",
-			...(defaultModeWarning ? { warning: defaultModeWarning } : {}),
-		});
+		document = readSettingsDocumentForLoad(SETTINGS_PATH);
 	} catch (error) {
-		return {
-			settings: mergeSettings(),
-			fileState: "malformed",
-			warning: `Could not read pitaj settings.json; using built-in defaults. ${errorMessage(error)}`,
+		const witness: SettingsFileWitness = { exists: false };
+		document = {
+			path: SETTINGS_PATH,
+			state: "malformed",
+			witness,
+			mode: 0o600,
+			error: errorMessage(error),
 		};
 	}
+
+	if (document.state !== "loaded") {
+		return withAutoRouteWarning({
+			settings: mergeSettings(),
+			fileState: document.state,
+			witness: document.witness,
+			document,
+			...(document.state === "malformed"
+				? { warning: `Could not read pitaj settings.json; using built-in defaults. ${document.error ?? "settings source is not usable"}` }
+			: {}),
+		});
+	}
+
+	const persistedWarnings = [warnInvalidPersistedDefaultMode(document.parsed), warnInvalidPersistedCharacterLimits(document.parsed)].filter(
+		(warning): warning is string => warning !== undefined,
+	);
+	return withAutoRouteWarning({
+		settings: mergeSettings(settingsFromUnknown(document.parsed)),
+		fileState: "loaded",
+		witness: document.witness,
+		document,
+		...(persistedWarnings.length > 0 ? { warning: persistedWarnings.join(" ") } : {}),
+	});
 }
 
 /** Attach the auto-route misconfiguration warning at load time, not first-consult time. */
-function withAutoRouteWarning(loaded: LoadedSettings): LoadedSettings {
+function withAutoRouteWarning<T extends LoadedSettings>(loaded: T): T {
 	const warning = validateAutoRouteAliases(loaded.settings);
 	if (!warning) return loaded;
 	return { ...loaded, warning: loaded.warning ? `${loaded.warning} ${warning}` : warning };
@@ -291,14 +353,42 @@ function addCompletedRoundUsage(
 	};
 }
 
-/** Exported for behavior tests; `streamImpl` is a DI seam for a fake stream. */
+/**
+ * The provider streaming entry point pitaj consults through.
+ *
+ * Pi resolves the effective pi-ai `Provider` for a model — including providers
+ * registered by other extensions — so consulting through
+ * `provider.streamSimple` preserves custom-provider streaming instead of
+ * hard-coding a built-in API implementation.
+ */
+export type PitajStreamSimple = Provider["streamSimple"];
+
+/**
+ * Resolve the effective provider streaming function for a model. Fails loudly
+ * rather than silently degrading: an unregistered provider is a configuration
+ * error the caller must see.
+ */
+function resolveProviderStream(ctx: ExtensionContext, modelProvider: string, resolvedModel: string): PitajStreamSimple {
+	const provider = ctx.modelRegistry.getProvider(modelProvider);
+	if (!provider) {
+		throw new Error(
+			`pitaj cannot reach provider "${modelProvider}" for ${resolvedModel}. Run /model to confirm the provider is registered.`,
+		);
+	}
+	if (typeof provider.streamSimple !== "function") {
+		throw new Error(`pitaj provider "${modelProvider}" does not support streaming consultations.`);
+	}
+	return provider.streamSimple.bind(provider);
+}
+
+/** Exported for behavior tests; `streamImpl` is a DI seam for a fake provider stream. */
 export async function consultModel(
 	request: PitajRequest,
 	ctx: ExtensionContext,
 	signal: AbortSignal | undefined,
 	loaded?: LoadedSettings,
 	onUpdate?: (update: { content: { type: "text"; text: string }[] }) => void,
-	streamImpl: typeof stream = stream,
+	streamImpl?: PitajStreamSimple,
 	executeEvidenceImpl: typeof executeOracleEvidence = executeOracleEvidence,
 ): Promise<{ answer: string; details: PitajResultDetails; usage?: AssistantMessage["usage"] }> {
 	const resolvedLoaded = loaded ?? loadSettings();
@@ -306,11 +396,21 @@ export async function consultModel(
 	const question = request.question.trim();
 	const baseMode = request.mode ?? settings.defaultMode;
 	const brevity = request.brevity ?? settings.defaultBrevity;
-	const maxContextChars = request.maxContextChars ?? settings.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS;
-	const maxOutputChars = resolveMaxOutputChars(request.maxOutputChars, settings, brevity);
+	let maxContextChars = DEFAULT_MAX_CONTEXT_CHARS;
+	let maxOutputChars = resolveMaxOutputChars(undefined, mergeSettings(), brevity);
+	let limitError: unknown;
+	try {
+		maxContextChars = validateCharLimit(
+			request.maxContextChars ?? settings.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS,
+			"maxContextChars",
+		);
+		maxOutputChars = resolveMaxOutputChars(request.maxOutputChars, settings, brevity);
+	} catch (error) {
+		limitError = error;
+	}
 	// Bound the context once so the request and its reported contextChars
-	// describe the same text.
-	const boundedContext = boundConsultContext(request.context, maxContextChars);
+	// describe the same text. Invalid limits fail below before any provider work.
+	const boundedContext = limitError ? "" : boundConsultContext(request.context, maxContextChars);
 	const autoRequested = request.model?.trim().toLowerCase() === "auto";
 	const facts: ConsultationFacts = {
 		mode: baseMode,
@@ -320,6 +420,8 @@ export async function consultModel(
 		contextChars: boundedContext.length,
 		maxOutputChars,
 	};
+
+	if (limitError) throw consultationFailure(limitError, facts);
 
 	if (!question) throw consultationFailure(new Error("pitaj needs a question."), facts);
 
@@ -385,8 +487,22 @@ export async function consultModel(
 	} catch (error) {
 		throw consultationFailure(error, facts);
 	}
-	if (!auth.ok || !auth.apiKey) {
-		throw consultationFailure(new Error(auth.ok ? `No API key for ${resolved.resolved}` : auth.error), facts);
+	if (!auth.ok) {
+		throw consultationFailure(new Error(auth.error), facts);
+	}
+	// Providers whose credentials resolve outside an API key (OAuth, cloud SDK
+	// profiles) report ok without one. Omit the absent field rather than
+	// failing a provider Pi already considers authenticated.
+	const requestAuth = {
+		...(auth.apiKey !== undefined ? { apiKey: auth.apiKey } : {}),
+		...(auth.headers !== undefined ? { headers: auth.headers } : {}),
+	};
+
+	let streamProvider: PitajStreamSimple;
+	try {
+		streamProvider = streamImpl ?? resolveProviderStream(ctx, model.provider, resolved.resolved);
+	} catch (error) {
+		throw consultationFailure(error, facts);
 	}
 
 	const userText = buildConsultUserText(question, boundedContext, maxContextChars);
@@ -401,13 +517,12 @@ export async function consultModel(
 	let evidenceExhausted = false;
 	let response: AssistantMessage | undefined;
 	let terminalText = "";
-	let streamError: unknown;
 	let combinedUsage: AssistantMessage["usage"] | undefined;
 
 	while (true) {
-		let streamResponse: ReturnType<typeof streamImpl>;
+		let streamResponse: AssistantMessageEventStream;
 		try {
-			streamResponse = streamImpl(
+			streamResponse = streamProvider(
 				model,
 				mode === "oracle"
 					? {
@@ -419,12 +534,22 @@ export async function consultModel(
 						systemPrompt: buildConsultSystemPrompt(mode, brevity),
 						messages,
 					},
-				{ apiKey: auth.apiKey, headers: auth.headers, signal },
+				{
+					...requestAuth,
+					...(signal ? { signal } : {}),
+					// Provider output-token ceiling for every round. This is a
+					// generation bound, not the local answer-body char cap.
+					maxTokens: PROVIDER_MAX_TOKENS[brevity],
+				},
 			);
 		} catch (error) {
 			throw consultationFailure(error, facts);
 		}
 		let roundText = "";
+		// Stream failure state is per round: a recovered earlier round must never
+		// contaminate the round that produces the final answer.
+		let roundStreamError: unknown;
+		let roundStreamThrew = false;
 		try {
 			for await (const event of streamResponse) {
 				if (event.type === "text_delta") {
@@ -433,21 +558,66 @@ export async function consultModel(
 				}
 			}
 		} catch (error) {
-			streamError = error;
+			roundStreamError = error;
+			roundStreamThrew = true;
+		}
+		// A thrown iterator is a dead round, decided before `result()` is touched:
+		// the provider's own summary of a broken stream is not evidence, so it is
+		// never requested or awaited. Failing here also keeps this round's usage
+		// unaccepted, runs no Oracle evidence, and starts no further round.
+		if (roundStreamThrew) {
+			throw consultationFailure(
+				new Error(
+					`pitaj consult failed mid-stream: ${errorMessage(roundStreamError)} (received ${roundText.length} chars of partial text before failure)`,
+				),
+				facts,
+			);
 		}
 		try {
 			response = await streamResponse.result();
 		} catch (error) {
-			throw consultationFailure(error, facts);
+			// A rejected result() is a dead round. Report the partial characters we
+			// actually accumulated so the caller can size what was lost.
+			throw consultationFailure(
+				new Error(
+					`pitaj consult failed mid-stream: ${errorMessage(error)} (received ${roundText.length} chars of partial text before failure)`,
+				),
+				facts,
+			);
+		}
+		terminalText = roundText;
+		// Provider-declared error/aborted rounds and malformed Oracle tool-use
+		// rounds are not accepted completed rounds, so reject them before usage is
+		// aggregated or any host evidence can run.
+		if (response.stopReason === "error" || response.stopReason === "aborted") {
+			try {
+				finalizeConsultAnswer(
+					{
+						stopReason: response.stopReason,
+						...(response.errorMessage ? { errorMessage: response.errorMessage } : {}),
+						rawText: getTextContent(response),
+						partialChars: roundText.length,
+					},
+					maxOutputChars,
+				);
+				throw new Error(`pitaj consult failed with provider stopReason ${response.stopReason}`);
+			} catch (error) {
+				throw consultationFailure(error, facts);
+			}
+		}
+		const oracleToolUseRound = mode === "oracle" && response.stopReason === "toolUse" && !evidenceExhausted;
+		if (response.stopReason === "toolUse" && !oracleToolUseRound) {
+			throw consultationFailure(new Error("pitaj provider requested an unavailable tool (stopReason toolUse)."), facts);
+		}
+		if (oracleToolUseRound && !response.content.some((part) => part.type === "toolCall")) {
+			throw consultationFailure(new Error("Oracle model requested evidence without a tool call."), facts);
 		}
 		combinedUsage = addCompletedRoundUsage(combinedUsage, response.usage);
-		terminalText = roundText;
-		if (mode !== "oracle" || response.stopReason !== "toolUse" || evidenceExhausted) break;
+		if (!oracleToolUseRound) break;
 
 		const toolCalls = response.content.filter(
 			(part): part is Extract<AssistantMessage["content"][number], { type: "toolCall" }> => part.type === "toolCall",
 		);
-		if (toolCalls.length === 0) throw consultationFailure(new Error("Oracle model requested evidence without a tool call."), facts);
 		let exhausted = false;
 		const toolResults: ToolResultMessage[] = [];
 		const persistedToolCallIds = new Set<string>();
@@ -506,7 +676,6 @@ export async function consultModel(
 				...(response.errorMessage ? { errorMessage: response.errorMessage } : {}),
 				rawText: rawAnswer,
 				partialChars: terminalText.length,
-				...(streamError instanceof Error ? { streamErrorMessage: streamError.message } : {}),
 			},
 			maxOutputChars,
 		);
@@ -570,17 +739,36 @@ async function runCheck(settings: PitajSettings, ctx: ExtensionContext): Promise
 			continue;
 		}
 
-		const model = ctx.modelRegistry.find(resolved.provider, resolved.modelId);
+		let model: ReturnType<ExtensionContext["modelRegistry"]["find"]>;
+		try {
+			model = ctx.modelRegistry.find(resolved.provider, resolved.modelId);
+		} catch {
+			model = undefined;
+		}
 		if (!model) {
 			lines.push(`  ✗ ${alias} -> ${resolved.resolved} (not registered)`);
 			allOk = false;
 			continue;
 		}
 
+		const provider = ctx.modelRegistry.getProvider(resolved.provider);
+		if (!provider) {
+			lines.push(`  ✗ ${alias} -> ${resolved.resolved} (provider not registered)`);
+			allOk = false;
+			continue;
+		}
+		if (typeof provider.streamSimple !== "function") {
+			lines.push(`  ✗ ${alias} -> ${resolved.resolved} (provider has no streamSimple)`);
+			allOk = false;
+			continue;
+		}
+
 		try {
 			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-			if (!auth.ok || !auth.apiKey) {
-				lines.push(`  ✗ ${alias} -> ${resolved.resolved} (no API key)`);
+			// Aligned with the consult path: an authenticated provider that resolves
+			// credentials without an API key is healthy, not broken.
+			if (!auth.ok) {
+				lines.push(`  ✗ ${alias} -> ${resolved.resolved} (no usable credentials)`);
 				allOk = false;
 			} else {
 				lines.push(`  ✓ ${alias} -> ${resolved.resolved}`);
@@ -588,7 +776,7 @@ async function runCheck(settings: PitajSettings, ctx: ExtensionContext): Promise
 		} catch {
 			lines.push(`  ✗ ${alias} -> ${resolved.resolved} (auth check failed)`);
 			allOk = false;
-		}
+	}
 	}
 
 	ctx.ui.notify(lines.join("\n"), allOk ? "info" : "warning");
@@ -622,11 +810,16 @@ export async function promptConfigValue(ctx: ExtensionContext, settings: PitajSe
 	if (field === "defaultMode") return ctx.ui.select("Choose default mode", [...PITAJ_DEFAULT_MODES]);
 	if (field === "defaultBrevity") return ctx.ui.select("Choose default brevity", [...PITAJ_BREVITIES]);
 	const current = settings[field] === undefined ? "" : String(settings[field]);
-	const hint = field === "maxContextChars" || field === "maxOutputChars" ? "blank/default/clear uses the built-in default" : current;
+	const hint =
+		field === "maxContextChars"
+			? "1-64000; blank/default/clear uses the built-in default"
+			: field === "maxOutputChars"
+				? "1-16000; blank/default/clear uses the built-in default"
+				: current;
 	return ctx.ui.input(`Enter ${field}`, hint);
 }
 
-async function runConfigUi(loaded: LoadedSettings, ctx: ExtensionContext): Promise<void> {
+async function runConfigUi(loaded: LoadedSettingsFile, ctx: ExtensionContext): Promise<void> {
 	const summary = summarizeSettings(loaded.settings, loaded.fileState);
 	if (loaded.fileState === "malformed") {
 		ctx.ui.notify(
@@ -700,7 +893,9 @@ async function runConfigUi(loaded: LoadedSettings, ctx: ExtensionContext): Promi
 	}
 
 	try {
-		writeFileSync(SETTINGS_PATH, serializeSettings(updated), "utf8");
+		// The prompt and confirmation above are awaited, so re-check that nobody
+		// edited settings.json meanwhile before replacing it atomically.
+		patchAndWriteSettingsDocument(SETTINGS_PATH, loaded.document, field, updated[field]);
 	} catch (error) {
 		ctx.ui.notify(`pitaj config save failed: ${errorMessage(error)}`, "error");
 		return;
@@ -711,14 +906,12 @@ async function runConfigUi(loaded: LoadedSettings, ctx: ExtensionContext): Promi
 
 export function parseSnapshotCommandArgs(args: string, settings: PitajSettings): ParsedCommandArgs | undefined {
 	const trimmed = args.trim();
-	const normalized = trimmed.toLowerCase();
-	if (normalized === "snapshot") {
-		return parseCommandArgs("", settings);
-	}
-	if (!normalized.startsWith("snapshot ")) {
-		return undefined;
-	}
-	return parseCommandArgs(trimmed.slice("snapshot".length).trim(), settings);
+	// Match the lexer's separator rule: the `snapshot` head ends at any
+	// whitespace, and a quoted "snapshot" is question text rather than a
+	// subcommand. The remainder stays raw so quoting survives into parsing.
+	const head = /^snapshot(?=\s|$)/i.exec(trimmed);
+	if (!head) return undefined;
+	return parseCommandArgs(trimmed.slice(head[0].length).trim(), settings);
 }
 
 export function buildSnapshotCommandRequest(
@@ -741,6 +934,7 @@ export function buildSnapshotCommandRequest(
 		question: parsed.question,
 		maxContextChars: settings.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS,
 		sessionManager: runtime.sessionManager,
+		recentUserMaxChars: runtime.recentUserMaxChars,
 		toolResults: runtime.toolResults,
 		customCategories,
 	});
@@ -801,15 +995,17 @@ const PitajParams = Type.Object({
 		}),
 	),
 	maxContextChars: Type.Optional(
-		Type.Number({
-			description: "Maximum characters of optional context to send. Defaults to settings.json maxContextChars.",
+		Type.Integer({
+			description: "Maximum characters of optional context to send (1..64000). Defaults to settings.json maxContextChars.",
 			minimum: 1,
+			maximum: 64_000,
 		}),
 	),
 	maxOutputChars: Type.Optional(
-		Type.Number({
-			description: "Maximum characters to return to the current model. Defaults to settings.json maxOutputChars.",
+		Type.Integer({
+			description: "Maximum characters to return to the current model (1..16000). Defaults to settings.json maxOutputChars.",
 			minimum: 1,
+			maximum: 16_000,
 		}),
 	),
 	oracleRoot: Type.Optional(
@@ -864,7 +1060,7 @@ function displayWarningsForResult(details: PitajResultDetails, warnings: readonl
 	return details.oracle?.exhausted ? [...warnings, ORACLE_EXHAUSTION_WARNING] : warnings;
 }
 
-export default function pitaj(pi: ExtensionAPI, streamImpl: typeof stream = stream): void {
+export default function pitaj(pi: ExtensionAPI, streamImpl?: PitajStreamSimple): void {
 	const snapshotToolResults = new SnapshotToolResultBuffer();
 	registerSnapshotToolResultCapture(pi, snapshotToolResults);
 	const usageRecorder = createUsageRecorder();
@@ -936,7 +1132,10 @@ export default function pitaj(pi: ExtensionAPI, streamImpl: typeof stream = stre
 			if (loaded.warning) ctx.ui.notify(loaded.warning, "warning");
 
 			const trimmed = args.trim();
-			const specialCommand = classifySpecialCommand(trimmed);
+			// One lexical pass decides the subcommand and supplies its argument
+			// tokens, so execution can never disagree with classification about a
+			// separator or a quoted argument.
+			const { command: specialCommand, rest: specialArgs } = parseSpecialCommand(trimmed);
 			if (specialCommand === "help") {
 				ctx.ui.notify(usageText(), "info");
 				return;
@@ -953,20 +1152,22 @@ export default function pitaj(pi: ExtensionAPI, streamImpl: typeof stream = stre
 			}
 
 			if (specialCommand === "config") {
-				const normalizedConfig = trimmed.toLowerCase();
 				const summary = summarizeSettings(loaded.settings, loaded.fileState);
-				if (normalizedConfig === "config" && ctx.hasUI) {
+				if (specialArgs.length === 0 && ctx.hasUI) {
 					await runConfigUi(loaded, ctx);
 					return;
 				}
-				const prefix = normalizedConfig !== "config" && normalizedConfig !== "config show" ? "Unsupported /pitaj config subcommand. Use /pitaj config for the UI or /pitaj config show for summary.\n\n" : "";
+				// A quoted "show" is literal text, not the show subcommand.
+				const supported = specialArgs.length === 0 || isUnquotedKeyword(specialArgs, "show");
+				const prefix = supported
+					? ""
+					: "Unsupported /pitaj config subcommand. Use /pitaj config for the UI or /pitaj config show for summary.\n\n";
 				ctx.ui.notify(`${prefix}${formatConfigSummaryText(summary, SETTINGS_PATH)}`, loaded.fileState === "malformed" ? "warning" : "info");
 				return;
 			}
 
 			if (specialCommand === "usage") {
-				const normalizedUsage = trimmed.toLowerCase();
-				if (normalizedUsage === "usage reset") {
+				if (isUnquotedKeyword(specialArgs, "reset")) {
 					usageRecorder.reset();
 					ctx.ui.notify("pitaj usage counters reset", "info");
 					return;
@@ -1110,7 +1311,15 @@ export default function pitaj(pi: ExtensionAPI, streamImpl: typeof stream = stre
 				}
 				return;
 			}
-			const snapshotParsed = parseSnapshotCommandArgs(trimmed, loaded.settings);
+			// Argument parsing rejects duplicate recognized flags instead of silently
+			// keeping one, so surface that as a notification before any consult.
+			let snapshotParsed: ParsedCommandArgs | undefined;
+			try {
+				snapshotParsed = parseSnapshotCommandArgs(trimmed, loaded.settings);
+			} catch (error) {
+				ctx.ui.notify(errorMessage(error), "error");
+				return;
+			}
 			if (snapshotParsed) {
 				let question = snapshotParsed.question;
 				if (!question && ctx.hasUI) {
@@ -1158,7 +1367,13 @@ export default function pitaj(pi: ExtensionAPI, streamImpl: typeof stream = stre
 				return;
 			}
 
-			const parsed = parseCommandArgs(trimmed, loaded.settings);
+			let parsed: ParsedCommandArgs;
+			try {
+				parsed = parseCommandArgs(trimmed, loaded.settings);
+			} catch (error) {
+				ctx.ui.notify(errorMessage(error), "error");
+				return;
+			}
 			let question = parsed.question;
 			if (!question && ctx.hasUI) {
 				const label = parsed.model ? `Question for pitaj ${parsed.model}` : "Question for pitaj";

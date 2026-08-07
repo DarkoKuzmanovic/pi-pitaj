@@ -22,6 +22,8 @@ export const PITAJ_AUTO_RISKS = ["low", "high"] as const;
 export type PitajAutoRisk = (typeof PITAJ_AUTO_RISKS)[number];
 
 export const DEFAULT_MAX_CONTEXT_CHARS = 12_000;
+export const MAX_CONTEXT_CHARS = 64_000;
+export const MAX_OUTPUT_CHARS = 16_000;
 export const DEFAULT_AUTO_ROUTE_LOW = "gpt";
 export const DEFAULT_AUTO_ROUTE_HIGH = "opus";
 
@@ -134,7 +136,11 @@ function isPitajBrevity(value: unknown): value is PitajBrevity {
 }
 
 function positiveInteger(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+	return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function boundedPositiveInteger(value: unknown, maximum: number): number | undefined {
+	return positiveInteger(value) !== undefined && (value as number) <= maximum ? (value as number) : undefined;
 }
 
 function trimmedNonEmptyString(value: unknown): string | undefined {
@@ -161,12 +167,68 @@ export function settingsFromUnknown(value: unknown): Partial<PitajSettings> {
 		defaultModel: trimmedNonEmptyString(value.defaultModel),
 		defaultMode: isPitajDefaultMode(value.defaultMode) ? value.defaultMode : undefined,
 		defaultBrevity: isPitajBrevity(value.defaultBrevity) ? value.defaultBrevity : undefined,
-		maxContextChars: positiveInteger(value.maxContextChars),
-		maxOutputChars: positiveInteger(value.maxOutputChars),
+		maxContextChars: boundedPositiveInteger(value.maxContextChars, MAX_CONTEXT_CHARS),
+		maxOutputChars: boundedPositiveInteger(value.maxOutputChars, MAX_OUTPUT_CHARS),
 		autoRouteLow: trimmedNonEmptyString(value.autoRouteLow)?.toLowerCase(),
 		autoRouteHigh: trimmedNonEmptyString(value.autoRouteHigh)?.toLowerCase(),
 		aliases: normalizeAliases(value.aliases),
 	};
+}
+
+
+/**
+ * Validate every known field before the config UI rewrites a raw settings
+ * document. Unknown fields remain forward-compatible, but an invalid known
+ * field must be repaired manually instead of being silently preserved by an
+ * unrelated UI edit.
+ */
+export function validateSettingsDocumentForWrite(value: unknown): PitajSettings {
+	if (!isRecord(value)) throw new Error("settings.json root must be a JSON object");
+	const parsed = settingsFromUnknown(value);
+	const problems: string[] = [];
+	if (value.defaultModel !== undefined && parsed.defaultModel === undefined) problems.push("defaultModel must be a non-empty string");
+	if (value.defaultMode !== undefined && parsed.defaultMode === undefined) problems.push(`defaultMode must be one of: ${PITAJ_DEFAULT_MODES.join(", ")}`);
+	if (value.defaultBrevity !== undefined && parsed.defaultBrevity === undefined) problems.push(`defaultBrevity must be one of: ${PITAJ_BREVITIES.join(", ")}`);
+	if (value.maxContextChars !== undefined && parsed.maxContextChars === undefined) problems.push(`maxContextChars must be a finite whole number between 1 and ${MAX_CONTEXT_CHARS}`);
+	if (value.maxOutputChars !== undefined && parsed.maxOutputChars === undefined) problems.push(`maxOutputChars must be a finite whole number between 1 and ${MAX_OUTPUT_CHARS}`);
+	if (value.autoRouteLow !== undefined && parsed.autoRouteLow === undefined) problems.push("autoRouteLow must be a non-empty alias name");
+	if (value.autoRouteHigh !== undefined && parsed.autoRouteHigh === undefined) problems.push("autoRouteHigh must be a non-empty alias name");
+	if (value.aliases !== undefined) {
+		if (!isRecord(value.aliases)) {
+			problems.push("aliases must be a JSON object");
+		} else {
+			const normalizedAliases = new Set<string>();
+			for (const [alias, target] of Object.entries(value.aliases)) {
+				const normalizedAlias = alias.trim().toLowerCase();
+				if (!normalizedAlias || typeof target !== "string" || !target.trim()) {
+					problems.push("aliases must contain non-empty string names and targets");
+					continue;
+				}
+				if (normalizedAliases.has(normalizedAlias)) problems.push(`aliases contain a duplicate normalized name: ${normalizedAlias}`);
+				normalizedAliases.add(normalizedAlias);
+				if (normalizedAlias === "auto" || normalizedAlias === "advise") problems.push(`reserved alias name is not allowed: ${normalizedAlias}`);
+			}
+		}
+	}
+	if (problems.length === 0) {
+		const effective = mergeSettings(parsed);
+		try {
+			resolveModelRef(effective.defaultModel, effective);
+		} catch (error) {
+			problems.push(`defaultModel: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		for (const alias of Object.keys(parsed.aliases ?? {})) {
+			try {
+				resolveModelRef(alias, effective);
+			} catch (error) {
+				problems.push(`alias ${alias}: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+		const routeWarning = validateAutoRouteAliases(effective);
+		if (routeWarning) problems.push(routeWarning);
+		if (problems.length === 0) return effective;
+	}
+	throw new Error(`settings.json has invalid known fields: ${problems.join("; ")}`);
 }
 
 /**
@@ -186,13 +248,30 @@ export function warnInvalidPersistedDefaultMode(value: unknown): string | undefi
 	return `pitaj settings.json defaultMode ${JSON.stringify(stored)} is not a valid default. ${fallback} ${valid}`;
 }
 
+/** Warn when persisted character caps are present but outside the hard bounds. */
+export function warnInvalidPersistedCharacterLimits(value: unknown): string | undefined {
+	if (!isRecord(value)) return undefined;
+	const problems: string[] = [];
+	for (const [field, maximum] of [["maxContextChars", MAX_CONTEXT_CHARS], ["maxOutputChars", MAX_OUTPUT_CHARS]] as const) {
+		if (value[field] === undefined) continue;
+		if (boundedPositiveInteger(value[field], maximum) === undefined) {
+			problems.push(`${field} must be a finite whole number between 1 and ${maximum}`);
+		}
+	}
+	return problems.length > 0
+		? `pitaj settings.json has invalid character limits: ${problems.join("; ")}. Using built-in defaults for invalid values.`
+		: undefined;
+}
+
 export function mergeSettings(overrides: Partial<PitajSettings> = {}): PitajSettings {
+	const maxContextChars = boundedPositiveInteger(overrides.maxContextChars, MAX_CONTEXT_CHARS);
+	const maxOutputChars = boundedPositiveInteger(overrides.maxOutputChars, MAX_OUTPUT_CHARS);
 	return {
 		defaultModel: overrides.defaultModel?.trim() || DEFAULT_SETTINGS.defaultModel,
 		defaultMode: overrides.defaultMode ?? DEFAULT_SETTINGS.defaultMode,
 		defaultBrevity: overrides.defaultBrevity ?? DEFAULT_SETTINGS.defaultBrevity,
-		...(overrides.maxContextChars !== undefined ? { maxContextChars: overrides.maxContextChars } : {}),
-		...(overrides.maxOutputChars !== undefined ? { maxOutputChars: overrides.maxOutputChars } : {}),
+		...(maxContextChars !== undefined ? { maxContextChars } : {}),
+		...(maxOutputChars !== undefined ? { maxOutputChars } : {}),
 		...(overrides.autoRouteLow !== undefined ? { autoRouteLow: overrides.autoRouteLow.toLowerCase() } : {}),
 		...(overrides.autoRouteHigh !== undefined ? { autoRouteHigh: overrides.autoRouteHigh.toLowerCase() } : {}),
 		aliases: {
@@ -300,37 +379,68 @@ export function resolveAutoRoute(input: AutoRouteInput, settings: PitajSettings)
 
 export type SpecialCommand = "help" | "aliases" | "models" | "check" | "snapshot" | "config" | "usage" | "auto" | "advise" | "none";
 
-export function classifySpecialCommand(input: string): SpecialCommand {
-	const normalized = input.trim().toLowerCase();
-	if (normalized === "config" || normalized.startsWith("config ")) {
-		return "config";
+/**
+ * One classified `/pitaj` subcommand plus the argument tokens that produced
+ * the decision.
+ *
+ * Execution consumes `rest` rather than re-splitting the raw input, so a tab
+ * or newline separator and a quoted argument mean exactly the same thing at
+ * execution time as they did at classification time.
+ */
+export interface SpecialCommandParse {
+	readonly command: SpecialCommand;
+	/** Tokens after the subcommand name, as the shared lexer produced them. */
+	readonly rest: readonly QuoteAwareToken[];
+}
+
+/** Match one unquoted keyword argument, case-insensitively. */
+export function isUnquotedKeyword(tokens: readonly QuoteAwareToken[], keyword: string): boolean {
+	return tokens.length === 1 && !tokens[0].quoted && tokens[0].value.toLowerCase() === keyword;
+}
+
+/**
+ * Classify a `/pitaj` argument string as a special subcommand, using the same
+ * quote-aware lexer as argument parsing so any whitespace separates the
+ * subcommand name and a quoted name stays literal question text.
+ */
+export function parseSpecialCommand(input: string): SpecialCommandParse {
+	const tokens = tokenizeCommandInput(input.trim());
+	const head = tokens[0];
+	const rest = tokens.slice(1);
+	const none: SpecialCommandParse = { command: "none", rest: [] };
+	if (!head || head.quoted) return none;
+	const name = head.value.toLowerCase();
+
+	// These three take further arguments of their own.
+	if (name === "config" || name === "auto" || name === "advise") return { command: name, rest };
+
+	if (name === "usage" && isUnquotedKeyword(rest, "reset")) {
+		return { command: "usage", rest };
 	}
-	if (normalized === "auto" || normalized.startsWith("auto ")) {
-		return "auto";
-	}
-	if (normalized === "advise" || normalized.startsWith("advise ")) {
-		return "advise";
-	}
-	switch (normalized) {
+	if (rest.length > 0) return none;
+
+	switch (name) {
 		case "help":
 		case "-h":
 		case "--help":
-			return "help";
+			return { command: "help", rest };
 		case "aliases":
 		case "models":
-			return normalized as "aliases" | "models";
+			return { command: name as "aliases" | "models", rest };
 		case "usage":
-		case "usage reset":
-			return "usage";
+			return { command: "usage", rest };
 		case "check":
-			return "check";
+			return { command: "check", rest };
 		case "snapshot":
-			return "snapshot";
-		case "config":
-			return "config";
+			return { command: "snapshot", rest };
 		default:
-			return "none";
+			return none;
 	}
+}
+
+/** Classification alone, for callers that do not need the argument tokens. */
+export function classifySpecialCommand(input: string): SpecialCommand {
+	return parseSpecialCommand(input).command;
 }
 
 export type AdviseFlagViolation = { forbiddenFlags: string[]; looksLikeModel: boolean };
@@ -339,13 +449,18 @@ export function isAdviseFlagViolation(
 	adviseInput: string,
 	settings: PitajSettings,
 ): AdviseFlagViolation {
-	const tokens = adviseInput.split(/\s+/);
-	const firstToken = tokens[0]?.toLowerCase();
+	const tokens = tokenizeCommandInput(adviseInput.trim());
+	const firstToken = tokens[0];
 	const forbiddenFlags = ["--mode", "-m", "--brevity", "-b", "--context", "-c"];
-	// Match both spaced (`--mode plan`) and inline (`--mode=plan`) forms.
-	const hasForbiddenFlags = forbiddenFlags.filter((f) => tokens.some((t) => t === f || t.startsWith(`${f}=`)));
+	// Match both spaced (`--mode plan`) and inline (`--mode=plan`) forms, but
+	// only when the flag token itself was unquoted syntax.
+	const hasForbiddenFlags = forbiddenFlags.filter(
+		(flag) => tokens.some((token) => !token.quoted && (token.value === flag || token.value.startsWith(`${flag}=`))),
+	);
 	const looksLikeModel =
-		firstToken && (firstToken.includes("/") || settings.aliases[firstToken]);
+		firstToken !== undefined &&
+		!firstToken.quoted &&
+		(firstToken.value.includes("/") || Boolean(settings.aliases[firstToken.value.toLowerCase()]));
 	return {
 		forbiddenFlags: hasForbiddenFlags,
 		looksLikeModel: Boolean(looksLikeModel),
@@ -358,35 +473,136 @@ export const BREVITY_OUTPUT_CHARS: Record<PitajBrevity, number> = {
 	detailed: 8_000,
 };
 
+/**
+ * Provider output-token ceiling requested for every consultation round.
+ *
+ * This bounds generation cost at the provider. It is deliberately distinct
+ * from `BREVITY_OUTPUT_CHARS`, which caps the answer body pitaj returns to the
+ * calling model, and from `maxOutputChars`, which is the exact local character
+ * contract. Tokens are not characters: the provider ceiling is a coarse upper
+ * bound, and the local character cap remains the final answer-body contract.
+ */
+export const PROVIDER_MAX_TOKENS: Record<PitajBrevity, number> = {
+	short: 2_048,
+	normal: 4_096,
+	detailed: 8_192,
+};
+
+export function validateCharLimit(value: unknown, field: "maxContextChars" | "maxOutputChars"): number {
+	const maximum = field === "maxContextChars" ? MAX_CONTEXT_CHARS : MAX_OUTPUT_CHARS;
+	if (!positiveInteger(value) || (value as number) > maximum) {
+		throw new Error(`${field} must be a finite whole number between 1 and ${maximum}.`);
+	}
+	return value as number;
+}
+
 export function resolveMaxOutputChars(
 	requestMaxOutputChars: number | undefined,
 	settings: PitajSettings,
 	brevity: PitajBrevity,
 ): number {
-	return requestMaxOutputChars ?? settings.maxOutputChars ?? BREVITY_OUTPUT_CHARS[brevity];
-};
+	if (requestMaxOutputChars !== undefined) return validateCharLimit(requestMaxOutputChars, "maxOutputChars");
+	if (settings.maxOutputChars !== undefined) return validateCharLimit(settings.maxOutputChars, "maxOutputChars");
+	return BREVITY_OUTPUT_CHARS[brevity];
+}
 
-interface QuoteAwareToken {
+/**
+ * One lexed command token plus the lexical provenance later stages need.
+ *
+ * `quoted` records that at least part of the token came from inside double
+ * quotes. Flag and model detection consume only unquoted tokens, so a quoted
+ * `"--mode"` or `"opus"` stays literal text.
+ */
+export interface QuoteAwareToken {
 	value: string;
 	quoted: boolean;
+}
+
+/**
+ * The single deterministic command lexer for `/pitaj`, `/pitaj auto`, and
+ * special-subcommand classification.
+ *
+ * Rules: any JavaScript whitespace outside quotes separates tokens; a double
+ * quote toggles quoting and is stripped; `\"` and `\\` produce a literal quote
+ * or backslash without toggling; an unbalanced quote falls back deterministically
+ * to plain whitespace splitting of the original input, with every token marked
+ * unquoted so no literal text is promoted to syntax.
+ */
+export function tokenizeCommandInput(input: string): QuoteAwareToken[] {
+	const tokens: QuoteAwareToken[] = [];
+	let current = "";
+	let hasCurrent = false;
+	let inQuotes = false;
+	let tokenWasQuoted = false;
+
+	const flush = (): void => {
+		if (hasCurrent) tokens.push({ value: current, quoted: tokenWasQuoted });
+		current = "";
+		hasCurrent = false;
+		tokenWasQuoted = false;
+	};
+
+	for (let i = 0; i < input.length; i++) {
+		const character = input[i];
+		if (character === "\\") {
+			const next = input[i + 1];
+			if (next === '"' || next === "\\") {
+				current += next;
+				hasCurrent = true;
+				i++;
+				continue;
+			}
+			current += character;
+			hasCurrent = true;
+			continue;
+		}
+		if (character === '"') {
+			inQuotes = !inQuotes;
+			tokenWasQuoted = true;
+			hasCurrent = true;
+			continue;
+		}
+		if (!inQuotes && /\s/.test(character)) {
+			flush();
+			continue;
+		}
+		current += character;
+		hasCurrent = true;
+	}
+
+	if (inQuotes) {
+		// An unbalanced quote would silently corrupt every later token. Fall back
+		// to plain whitespace splitting of the raw input instead of guessing.
+		return input.split(/\s+/).filter(Boolean).map((value) => ({ value, quoted: false }));
+	}
+
+	flush();
+	return tokens.filter((token) => token.value !== "" || token.quoted);
 }
 
 export function parseCommandArgs(args: string, settings: PitajSettings): ParsedCommandArgs {
 	const trimmed = args.trim();
 	if (!trimmed) return { question: "" };
 
-	// Pre-process: merge quoted tokens into single tokens
-	return parseCommandTokens(tokenizeWithQuotes(trimmed).map(({ value }) => value), settings);
+	return parseCommandTokens(tokenizeCommandInput(trimmed), settings);
 }
 
-/** Parse already quote-aware tokens. Shared by `/pitaj` and `/pitaj auto`. */
-function parseCommandTokens(tokens: string[], settings: PitajSettings): ParsedCommandArgs {
+/** Reject a second consumed occurrence of the same recognized top-level flag. */
+function rejectDuplicateFlag(alreadySet: boolean, canonicalFlag: string): void {
+	if (!alreadySet) return;
+	throw new Error(`pitaj: ${canonicalFlag} was given more than once. Use a single ${canonicalFlag} value.`);
+}
+
+/** Parse already lexed quote-aware tokens. Shared by `/pitaj` and `/pitaj auto`. */
+function parseCommandTokens(tokens: readonly QuoteAwareToken[], settings: PitajSettings): ParsedCommandArgs {
 	let i = 0;
 
-	// Check if the first token is a known alias or provider/model
+	// The model may only come from an unquoted leading token: a quoted "opus"
+	// is the word, not the alias.
 	let model: string | undefined;
-	if (tokens[0] && (settings.aliases[tokens[0].toLowerCase()] || tokens[0].includes("/"))) {
-		model = tokens[0];
+	const first = tokens[0];
+	if (first && !first.quoted && (settings.aliases[first.value.toLowerCase()] || first.value.includes("/"))) {
+		model = first.value;
 		i = 1;
 	}
 
@@ -397,18 +613,28 @@ function parseCommandTokens(tokens: string[], settings: PitajSettings): ParsedCo
 
 	while (i < tokens.length) {
 		const token = tokens[i];
-		if ((token === "--mode" || token === "-m") && i + 1 < tokens.length) {
-			const val = tokens[++i];
-			if (PITAJ_MODES.includes(val as PitajMode)) mode = val as PitajMode;
-			else questionParts.push(token, val);
-		} else if ((token === "--brevity" || token === "-b") && i + 1 < tokens.length) {
-			const val = tokens[++i];
-			if (PITAJ_BREVITIES.includes(val as PitajBrevity)) brevity = val as PitajBrevity;
-			else questionParts.push(token, val);
-		} else if ((token === "--context" || token === "-c") && i + 1 < tokens.length) {
-			context = tokens[++i];
+		const flag = token.quoted ? "" : token.value;
+		if ((flag === "--mode" || flag === "-m") && i + 1 < tokens.length) {
+			const value = tokens[++i];
+			if (!value.quoted && PITAJ_MODES.includes(value.value as PitajMode)) {
+				rejectDuplicateFlag(mode !== undefined, "--mode");
+				mode = value.value as PitajMode;
+			} else {
+				questionParts.push(token.value, value.value);
+			}
+		} else if ((flag === "--brevity" || flag === "-b") && i + 1 < tokens.length) {
+			const value = tokens[++i];
+			if (!value.quoted && PITAJ_BREVITIES.includes(value.value as PitajBrevity)) {
+				rejectDuplicateFlag(brevity !== undefined, "--brevity");
+				brevity = value.value as PitajBrevity;
+			} else {
+				questionParts.push(token.value, value.value);
+			}
+		} else if ((flag === "--context" || flag === "-c") && i + 1 < tokens.length) {
+			rejectDuplicateFlag(context !== undefined, "--context");
+			context = tokens[++i].value;
 		} else {
-			questionParts.push(token);
+			questionParts.push(token.value);
 		}
 		i++;
 	}
@@ -421,27 +647,27 @@ export interface ParsedAutoCommandArgs extends ParsedCommandArgs {
 }
 
 /**
- * Parse `/pitaj auto` arguments through the same quote-aware tokenizer as
- * `/pitaj`. Only an unquoted, top-level `--risk low|high` token pair is
- * consumed for routing; quoted risk text stays inside context or question text.
- * Duplicate, missing, and invalid risk values are rejected instead of guessed.
+ * Parse `/pitaj auto` arguments through the same quote-aware lexer as `/pitaj`.
+ * Only an unquoted, top-level `--risk low|high` token pair is consumed for
+ * routing; quoted risk text stays inside context or question text. Duplicate,
+ * missing, and invalid risk values are rejected instead of guessed.
  */
 export function parseAutoCommandArgs(args: string, settings: PitajSettings): ParsedAutoCommandArgs {
 	const trimmed = args.trim();
 	if (!trimmed) return { question: "" };
 
-	const tokens = tokenizeWithQuotes(trimmed);
-	const remaining: string[] = [];
+	const tokens = tokenizeCommandInput(trimmed);
+	const remaining: QuoteAwareToken[] = [];
 	let risk: PitajAutoRisk | undefined;
 
 	for (let i = 0; i < tokens.length; i++) {
 		const token = tokens[i];
 		if (token.quoted || token.value.toLowerCase() !== "--risk") {
-			remaining.push(token.value);
+			remaining.push(token);
 			// Keep a context value with its `-c`/`--context` flag so a literal
 			// `--risk` used as that value cannot be mistaken for routing syntax.
 			if (!token.quoted && (token.value === "-c" || token.value === "--context") && i + 1 < tokens.length) {
-				remaining.push(tokens[++i].value);
+				remaining.push(tokens[++i]);
 			}
 			continue;
 		}
@@ -453,7 +679,7 @@ export function parseAutoCommandArgs(args: string, settings: PitajSettings): Par
 			throw new Error("pitaj auto: --risk requires a value: low or high.");
 		}
 		if (valueToken.quoted) {
-			remaining.push(token.value, valueToken.value);
+			remaining.push(token, valueToken);
 			i++;
 			continue;
 		}
@@ -467,39 +693,6 @@ export function parseAutoCommandArgs(args: string, settings: PitajSettings): Par
 	}
 
 	return { ...parseCommandTokens(remaining, settings), ...(risk ? { risk } : {}) };
-}
-
-/** Split on whitespace, merge quoted segments, and retain whether each token was quoted. */
-function tokenizeWithQuotes(input: string): QuoteAwareToken[] {
-	// An unbalanced quote would silently corrupt every token after the stray
-	// character; fall back to plain whitespace splitting instead.
-	const quoteCount = (input.match(/"/g) ?? []).length;
-	if (quoteCount % 2 !== 0) {
-		return input.split(/\s+/).filter(Boolean).map((value) => ({ value, quoted: false }));
-	}
-	const tokens: QuoteAwareToken[] = [];
-	let current = "";
-	let inQuotes = false;
-	let tokenWasQuoted = false;
-
-	for (let i = 0; i < input.length; i++) {
-		const ch = input[i];
-		if (ch === '"') {
-			inQuotes = !inQuotes;
-			tokenWasQuoted = true;
-			continue; // strip quote character
-		}
-		if (ch === " " && !inQuotes) {
-			if (current) tokens.push({ value: current, quoted: tokenWasQuoted });
-			current = "";
-			tokenWasQuoted = false;
-			continue;
-		}
-		current += ch;
-	}
-
-	if (current) tokens.push({ value: current, quoted: tokenWasQuoted });
-	return tokens;
 }
 
 export function summarizeSettings(settings: PitajSettings, fileState: PitajSettingsFileState): SettingsSummary {
@@ -560,6 +753,42 @@ export function serializeSettings(settings: PitajSettings): string {
 	return `${JSON.stringify(serialized, null, 2)}\n`;
 }
 
+/**
+ * Snapshot of settings.json exactly as pitaj read it, used as the
+ * compare-and-swap witness for a later write.
+ */
+export interface SettingsFileWitness {
+	exists: boolean;
+	/** Exact UTF-8 text read from disk; absent when the file did not exist. */
+	content?: string;
+}
+
+/**
+ * Compare and swap: report whether settings.json changed on disk between the
+ * moment pitaj read it and the moment it is about to be written.
+ *
+ * A config edit spans an interactive prompt and confirmation, so another editor
+ * or another pitaj session can win the race. Returns an actionable refusal
+ * reason when the file was modified, created, or removed meanwhile, or
+ * undefined when the write may proceed.
+ */
+export function detectConcurrentSettingsChange(
+	witness: SettingsFileWitness,
+	current: SettingsFileWitness,
+): string | undefined {
+	const reread = "Re-run /pitaj config to see the current values and apply the change again.";
+	if (!witness.exists && current.exists) {
+		return `pitaj settings.json was created on disk since it was read; not overwriting it. ${reread}`;
+	}
+	if (witness.exists && !current.exists) {
+		return `pitaj settings.json was removed on disk since it was read; not recreating it from a stale copy. ${reread}`;
+	}
+	if (witness.exists && current.exists && witness.content !== current.content) {
+		return `pitaj settings.json changed on disk since it was read; not overwriting those edits. ${reread}`;
+	}
+	return undefined;
+}
+
 export function planSettingsWrite(_settings: PitajSettings, fileState: PitajSettingsFileState): SettingsWritePlan {
 	if (fileState === "malformed") {
 		return {
@@ -591,8 +820,9 @@ function parseOptionalPositiveInteger(raw: string, field: ConfigEditableField): 
 		return undefined;
 	}
 	const parsed = Number(trimmed);
-	if (!Number.isInteger(parsed) || parsed <= 0) {
-		throw new Error(`${field} must be a positive integer, blank, default, or clear.`);
+	const maximum = field === "maxContextChars" ? MAX_CONTEXT_CHARS : MAX_OUTPUT_CHARS;
+	if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0 || parsed > maximum) {
+		throw new Error(`${field} must be a finite whole number between 1 and ${maximum}, blank, default, or clear.`);
 	}
 	return parsed;
 }
@@ -697,12 +927,16 @@ export function finalizeConsultAnswer(
 	maxOutputChars: number,
 ): { answer: string; truncated: boolean } {
 	if (outcome.stopReason === "aborted") {
-		throw new Error("pitaj consult was aborted.");
+		const detail = outcome.errorMessage?.trim() || outcome.streamErrorMessage?.trim();
+		const boundedDetail = detail ? `: ${truncateText(detail, 500)}` : "";
+		throw new Error(
+			`pitaj consult was aborted${boundedDetail} (received ${outcome.partialChars} chars of partial text before failure)`,
+		);
 	}
 	if (outcome.stopReason === "error") {
 		const detail = outcome.errorMessage?.trim() || outcome.streamErrorMessage?.trim() || "unknown provider error";
 		throw new Error(
-			`pitaj consult failed mid-stream: ${detail} (received ${outcome.partialChars} chars of partial text before failure)`,
+			`pitaj consult failed mid-stream: ${truncateText(detail, 500)} (received ${outcome.partialChars} chars of partial text before failure)`,
 		);
 	}
 	const cap = Math.max(0, Math.floor(maxOutputChars));

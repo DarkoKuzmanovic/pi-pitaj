@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { constants } from "node:fs";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
-import { relative, resolve, sep } from "node:path";
+import { devNull } from "node:os";
+import { resolve } from "node:path";
 import { promisify } from "node:util";
 import { StringEnum, type Tool } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -11,7 +12,9 @@ import {
 	ORACLE_EVIDENCE_OPERATIONS,
 	ORACLE_MAX_RESULT_CHARS,
 	resolveRootRelativePath,
+	relativeRootPath,
 	scanForSecrets,
+	selectPathApi,
 	truncateEvidenceResult,
 	type OracleEvidenceOperation,
 } from "./oracle-policy.ts";
@@ -33,20 +36,58 @@ const GIT_DIFF_BASE_ARGS = ["diff", "HEAD", "--no-ext-diff", "--no-textconv"];
 const GIT_CACHED_DIFF_ARGS = ["diff", "--cached", "--no-ext-diff", "--no-textconv"];
 const GIT_UNSTAGED_DIFF_ARGS = ["diff", "--no-ext-diff", "--no-textconv"];
 
-/** Repository-selection variables must never redirect Git away from its cwd. */
-const GIT_SELECTION_ENV_VARS = [
-	"GIT_DIR",
-	"GIT_WORK_TREE",
-	"GIT_COMMON_DIR",
-	"GIT_INDEX_FILE",
-	"GIT_OBJECT_DIRECTORY",
-	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
-] as const;
+/**
+ * Fixed argv prefix applied to every Oracle Git subprocess.
+ *
+ * `--no-optional-locks` keeps read-only evidence from writing index locks, and
+ * `-c core.fsmonitor=false` overrides any repository-local or inherited
+ * filesystem-monitor program. Command-line `-c` has the highest configuration
+ * precedence, so a checked-in `.git/config` cannot reintroduce it.
+ */
+const GIT_HARDENED_ARG_PREFIX = ["--no-optional-locks", "-c", "core.fsmonitor=false"] as const;
 
-function sanitizedGitEnvironment(): NodeJS.ProcessEnv {
-	const environment = { ...process.env };
-	for (const variable of GIT_SELECTION_ENV_VARS) delete environment[variable];
+/**
+ * Environment rebuilt for every Oracle Git subprocess.
+ *
+ * Every inherited Git variable is removed rather than a named subset, matched
+ * case-insensitively: Windows environment lookup ignores case, so `git_dir`
+ * and `Git_External_Diff` select a repository or run a program exactly like
+ * the uppercase spellings do.
+ * repository selection (`GIT_DIR`, `GIT_WORK_TREE`, ...), configuration
+ * injection (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_COUNT`),
+ * and program-executing variables (`GIT_EXTERNAL_DIFF`, `GIT_SSH_COMMAND`,
+ * `GIT_PAGER`, ...) are all `GIT_*`, so an allowlist would keep growing. Only
+ * the values below are added back.
+ *
+ * Residual trust, stated exactly: this bounds Git's own configuration and
+ * repository selection. It does not sandbox the process. `PATH` is still
+ * inherited, so the resolved `git` executable itself is trusted; the working
+ * tree is still read through the trusted `git` binary; and non-`GIT_*`
+ * variables (`PATH`, `HOME`, `SSH_AUTH_SOCK`, ...) are preserved because
+ * removing them would break ordinary local Git operation. A hostile `git` on
+ * `PATH`, or a hostile system Git installation, remains out of scope.
+ */
+export function buildHardenedGitEnvironment(inherited: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const environment: NodeJS.ProcessEnv = {};
+	for (const [name, value] of Object.entries(inherited)) {
+		if (name.toUpperCase().startsWith("GIT_")) continue;
+		environment[name] = value;
+	}
+	// Read-only evidence never needs an index lock or an interactive prompt, and
+	// C locale keeps parsed Git output stable.
+	environment.GIT_OPTIONAL_LOCKS = "0";
+	environment.GIT_TERMINAL_PROMPT = "0";
+	environment.LC_ALL = "C";
+	// Portable system/global configuration isolation: `GIT_CONFIG_NOSYSTEM`
+	// drops the system file, and pointing the global file at the platform null
+	// device drops user configuration without assuming a POSIX `/dev/null`.
+	environment.GIT_CONFIG_NOSYSTEM = "1";
+	environment.GIT_CONFIG_GLOBAL = devNull;
 	return environment;
+}
+
+function hardenedGitEnvironment(): NodeJS.ProcessEnv {
+	return buildHardenedGitEnvironment(process.env);
 }
 
 function gitExecutionOptions(cwd: string, maxBuffer: number) {
@@ -54,7 +95,24 @@ function gitExecutionOptions(cwd: string, maxBuffer: number) {
 		cwd,
 		encoding: "utf8" as const,
 		maxBuffer,
-		env: sanitizedGitEnvironment(),
+		env: hardenedGitEnvironment(),
+	};
+}
+
+/**
+ * The single hardened boundary for every Oracle Git subprocess. Arguments stay
+ * a fixed array passed to `execFile` — never a shell string — and always carry
+ * the hardened prefix.
+ */
+async function runOracleGit(
+	cwd: string,
+	args: readonly string[],
+	maxBuffer: number,
+): Promise<{ stdout: string; stderr: string }> {
+	const response = await execFileAsync("git", [...GIT_HARDENED_ARG_PREFIX, ...args], gitExecutionOptions(cwd, maxBuffer));
+	return {
+		stdout: typeof response.stdout === "string" ? response.stdout : String(response.stdout),
+		stderr: typeof response.stderr === "string" ? response.stderr : String(response.stderr),
 	};
 }
 
@@ -129,8 +187,7 @@ function parseEvidenceRequest(value: unknown): ParsedEvidenceRequest | OracleAda
 }
 
 function pathIsInside(root: string, candidate: string): boolean {
-	const pathRelative = relative(root, candidate);
-	return pathRelative !== "" && !pathRelative.startsWith(`..${sep}`) && pathRelative !== "..";
+	return relativeRootPath(root, candidate) !== undefined;
 }
 
 function isMissingPathError(error: unknown): boolean {
@@ -145,15 +202,21 @@ function isMissingPathError(error: unknown): boolean {
  * clean result after all existing ancestors have still passed this check.
  */
 async function assertStablePath(root: string, candidate: string, allowMissingPath = false): Promise<void> {
-	if (!pathIsInside(root, candidate)) throw new Error("path is outside the approved root");
-	const relativePath = relative(root, candidate);
+	// The same shared flavor helper the containment policy uses, so segment
+	// splitting and joining never disagree with the containment decision.
+	const api = selectPathApi(root);
+	const relativePath = relativeRootPath(root, candidate);
+	if (relativePath === undefined) throw new Error("path is outside the approved root");
 	if (isDeniedPath(relativePath)) throw new Error("path is denied by the sensitive-material policy");
 
 	let current = root;
-	for (const segment of relativePath.split(sep)) {
+	// `isDeniedPath` above remains conservatively cross-separator. Ancestor
+	// traversal itself must use the selected platform separator, because a
+	// backslash is an ordinary filename character on POSIX.
+	for (const segment of relativePath.split(api.sep)) {
 		if (!segment) continue;
 		if (isDeniedSegment(segment)) throw new Error("path is denied by the sensitive-material policy");
-		current = resolve(current, segment);
+		current = api.resolve(current, segment);
 		try {
 			const metadata = await lstat(current);
 			if (metadata.isSymbolicLink()) throw new Error("symbolic links are not allowed for evidence paths");
@@ -192,7 +255,9 @@ async function readRegularFile(root: ApprovedOracleRoot, requestedPath: string):
 		if (!metadata.isFile()) throw new Error("requested path is not a regular file");
 		if (metadata.size > MAX_FILE_BYTES) throw new Error("requested file exceeds the evidence size limit");
 		const text = await handle.readFile({ encoding: "utf8" });
-		return { text, relativePath: relative(root.path, path) };
+		const relativePath = relativeRootPath(root.path, path);
+		if (relativePath === undefined) throw new Error("path is outside the approved root");
+		return { text, relativePath };
 	} finally {
 		await handle.close();
 	}
@@ -221,7 +286,8 @@ async function listFiles(root: ApprovedOracleRoot, requestedPath: string | undef
 		try {
 			await assertStablePath(root.path, candidate);
 			const kind = entry.isDirectory() ? "/" : entry.isFile() ? "" : " [unsupported]";
-			lines.push(`${relative(root.path, candidate)}${kind}`);
+			const relativePath = relativeRootPath(root.path, candidate);
+			if (relativePath !== undefined) lines.push(`${relativePath}${kind}`);
 		} catch {
 			// Do not disclose unsafe or ambiguous entries.
 		}
@@ -241,14 +307,15 @@ interface SearchCandidates {
  * and build trees never become candidates. Throws when Git cannot enumerate.
  */
 async function collectSearchCandidates(root: ApprovedOracleRoot, directory: string): Promise<SearchCandidates> {
-	const relativeDirectory = relative(root.path, directory);
-	const response = await execFileAsync(
-		"git",
+	const relativeDirectory = relativeRootPath(root.path, directory, true);
+	if (relativeDirectory === undefined) throw new Error("search directory is outside the approved root");
+	const response = await runOracleGit(
+		root.path,
 		// `:(literal)` keeps a directory name from being read as pathspec magic.
 		["ls-files", "-co", "--exclude-standard", "-z", ...(relativeDirectory ? ["--", `:(literal)${relativeDirectory}`] : [])],
-		gitExecutionOptions(root.path, MAX_CANDIDATE_LIST_BYTES),
+		MAX_CANDIDATE_LIST_BYTES,
 	);
-	const listed = typeof response.stdout === "string" ? response.stdout : String(response.stdout);
+	const listed = response.stdout;
 	const unique = [...new Set(listed.split("\0").filter(Boolean))].sort((left, right) => left.localeCompare(right));
 	return {
 		relativePaths: unique.slice(0, MAX_SEARCH_CANDIDATES),
@@ -386,9 +453,7 @@ async function runBoundedGit(root: ApprovedOracleRoot, args: string[], budget?: 
 	const maxBuffer = budget?.remaining ?? MAX_DIFF_BYTES;
 	if (maxBuffer <= 0) throw new OversizedGitOutputError("git output exceeded the host buffer limit");
 	try {
-		const response = await execFileAsync("git", args, gitExecutionOptions(root.path, maxBuffer));
-		const stdout = typeof response.stdout === "string" ? response.stdout : String(response.stdout);
-		const stderr = typeof response.stderr === "string" ? response.stderr : String(response.stderr);
+		const { stdout, stderr } = await runOracleGit(root.path, args, maxBuffer);
 		budget?.consume(stdout, stderr);
 		return stdout;
 	} catch (error) {
@@ -494,8 +559,8 @@ async function gitDiff(root: ApprovedOracleRoot, maxChars: number): Promise<Orac
 /** Canonical Git top-level directory containing `directory`. */
 async function canonicalGitTopLevel(directory: string): Promise<string> {
 	const canonicalDirectory = await realpath(directory.trim());
-	const response = await execFileAsync("git", ["rev-parse", "--show-toplevel"], gitExecutionOptions(canonicalDirectory, 16 * 1024));
-	return await realpath(String(response.stdout).trim());
+	const response = await runOracleGit(canonicalDirectory, ["rev-parse", "--show-toplevel"], 16 * 1024);
+	return await realpath(response.stdout.trim());
 }
 
 /**

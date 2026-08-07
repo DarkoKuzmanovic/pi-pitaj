@@ -3,36 +3,23 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import {
 	BREVITY_OUTPUT_CHARS,
-	PITAJ_AUTO_RISKS,
-	CONFIG_EDITABLE_FIELDS,
 	USAGE_BUDGET,
+	applyUsageWarningFlags,
+	boundConsultContext,
 	buildConsultSystemPrompt,
 	buildConsultUserText,
-	boundConsultContext,
-	classifySpecialCommand,
-	isAdviseFlagViolation,
-	applyConfigUpdate,
-	formatSettingsChangeSummary,
-	formatResultForDisplay,
-	formatConfigSummaryText,
-	applyUsageWarningFlags,
 	buildInlineWarnings,
 	buildUsageSummary,
+	classifySpecialCommand,
 	classifyUsageEvent,
 	createUsageStore,
 	detectContextSource,
 	describeRouteKind,
-	formatUsageSummaryText,
-	mergeSettings,
-	planSettingsWrite,
-	parseCommandArgs,
-	resolveAutoRoute,
-	resolveMaxOutputChars,
-	resolveModelRef,
-	settingsFromUnknown,
-	serializeSettings,
-	summarizeSettings,
 	finalizeConsultAnswer,
+	formatResultForDisplay,
+	formatUsageSummaryText,
+	isAdviseFlagViolation,
+	mergeSettings,
 	truncateText,
 } from "./helpers.ts";
 import { buildSnapshotCommandRequest, parseSnapshotCommandArgs } from "./index.ts";
@@ -44,12 +31,12 @@ import {
 	SNAPSHOT_PROVENANCE_LABEL_TEMPLATE,
 } from "./snapshot.ts";
 import {
+	SNAPSHOT_OMITTED_SENSITIVE_TEXT,
 	SnapshotToolResultBuffer,
 	buildRuntimeSnapshotInput,
 	registerSnapshotToolResultCapture,
 } from "./snapshot-runtime.ts";
 
-const SETTINGS_PATH = "/home/quzma/.pi/agent/extensions/pi-pitaj/settings.json";
 
 describe("pitaj prompt shaping", () => {
 	it("includes mode and brevity in the consult system prompt", () => {
@@ -86,6 +73,56 @@ describe("pitaj exact text caps", () => {
 		assert.equal(truncateText("abcdef", 0), "");
 		assert.equal(truncateText("abcdef", 1), "a");
 		assert.equal(truncateText("abcdef", 4), "abcd");
+	});
+
+
+	describe("snapshot truncation bounds", () => {
+		it("keeps category markers within the cap and reports the exact omitted count when the marker fits", () => {
+			for (const maxContextChars of [1, 2, 10, 80, 120, 240]) {
+				const source = "x".repeat(300);
+				const result = buildSnapshotContext({
+					question: "q",
+					maxContextChars,
+					categories: [
+						{
+							category: "tool-results",
+							title: "Tools",
+							content: source,
+							sourceKind: "tool-result-ring-buffer",
+							sourceLabel: "test",
+						},
+					],
+				});
+				assert.ok(result.context.length <= maxContextChars);
+				const marker = /\[snapshot:tool-results truncated (\d+) chars\]/.exec(result.context);
+				if (marker) {
+					const markerStart = result.context.indexOf(marker[0]);
+					const kept = result.context.slice(0, markerStart).replace(/\s+$/, "").length;
+					assert.equal(Number(marker[1]), source.length - kept + (result.context.length - markerStart - marker[0].length));
+				}
+			}
+		});
+
+
+		it("reports exact category omission when the retained prefix ends in whitespace", () => {
+			const source = `${"x".repeat(380)}${" ".repeat(80)}${"y".repeat(1_000)}`;
+			const result = buildSnapshotContext({
+				question: "q",
+				maxContextChars: 1_000,
+				categories: [
+					{
+						category: "tool-results",
+						title: "Tools",
+						content: source,
+						sourceKind: "tool-result-ring-buffer",
+						sourceLabel: "test",
+					},
+				],
+			});
+			const marker = /\[snapshot:tool-results truncated (\d+) chars\]/.exec(result.context);
+			assert.ok(marker);
+			assert.equal(Number(marker[1]), source.length - 380);
+		});
 	});
 
 	it("leaves text that already fits untouched", () => {
@@ -609,6 +646,294 @@ describe("runtime snapshot collection seam", () => {
 	});
 });
 
+describe("automatic snapshot capture privacy", () => {
+	const AWS_KEY_LINE = 'aws_secret_access_key = AKIAIOSFODNN7EXAMPLE0123456789ABCDEFGHIJ';
+	const PRIVATE_KEY_BLOCK = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQ\n-----END RSA PRIVATE KEY-----";
+
+	it("discards secret-bearing tool results before ring-buffer retention", () => {
+		const buffer = new SnapshotToolResultBuffer({ maxItems: 5, maxItemChars: 400, maxTotalChars: 800 });
+		buffer.record({ toolName: "bash", result: `env dump\n${AWS_KEY_LINE}`, isError: false });
+
+		const content = buffer.toSnapshotCategoryInput()?.content ?? "";
+		assert.match(content, /\[snapshot source omitted: possible sensitive material\]/);
+		assert.doesNotMatch(content, /AKIA/);
+		assert.doesNotMatch(content, /aws_secret_access_key/);
+	});
+
+	it("never names the secret, detector, or line in the omission marker", () => {
+		const buffer = new SnapshotToolResultBuffer({ maxItems: 5, maxItemChars: 400, maxTotalChars: 800 });
+		buffer.record({ toolName: "read", result: `line one\n${PRIVATE_KEY_BLOCK}\nline three`, isError: false });
+
+		const content = buffer.toSnapshotCategoryInput()?.content ?? "";
+		assert.equal(content, `- read (ok): ${SNAPSHOT_OMITTED_SENSITIVE_TEXT}`);
+		assert.doesNotMatch(content, /PRIVATE KEY|pattern|regex|line \d/i);
+	});
+
+	it("leaves safe tool results and TypeScript password declarations unchanged", () => {
+		const buffer = new SnapshotToolResultBuffer({ maxItems: 5, maxItemChars: 400, maxTotalChars: 800 });
+		buffer.record({ toolName: "read", result: "interface User { password: string; }", isError: false });
+		buffer.record({ toolName: "npm", result: "tests passed", isError: false });
+
+		const content = buffer.toSnapshotCategoryInput()?.content ?? "";
+		assert.match(content, /password: string;/);
+		assert.match(content, /tests passed/);
+		assert.doesNotMatch(content, /snapshot source omitted/);
+	});
+
+	it("omits a secret-bearing recent user message from automatic capture", () => {
+		const entries = new Map<string, unknown>([
+			[
+				"leaf",
+				{
+					type: "message",
+					id: "leaf",
+					parentId: null,
+					message: { role: "user", content: `rotate this for me: ${AWS_KEY_LINE}` },
+				},
+			],
+		]);
+
+		const input = buildRuntimeSnapshotInput({
+			question: "What now?",
+			maxContextChars: 1_000,
+			sessionManager: {
+				getLeafEntry: () => entries.get("leaf"),
+				getEntry: (id: string) => entries.get(id),
+			},
+		});
+
+		const recent = input.categories.find((item) => item.category === "recent-user-request");
+		assert.equal(recent?.content, SNAPSHOT_OMITTED_SENSITIVE_TEXT);
+		assert.doesNotMatch(JSON.stringify(input), /AKIA/);
+	});
+
+	it("keeps the explicit question and caller-provided context unscanned", () => {
+		const settings = mergeSettings({ maxContextChars: 2_000 });
+		const built = buildSnapshotCommandRequest(
+			{
+				question: `is ${AWS_KEY_LINE} rotated?`,
+				context: PRIVATE_KEY_BLOCK,
+				model: undefined,
+				mode: undefined,
+				brevity: undefined,
+			},
+			settings,
+			{},
+		);
+
+		assert.match(built.request.context ?? "", /AKIA/);
+		assert.match(built.request.context ?? "", /BEGIN RSA PRIVATE KEY/);
+	});
+
+	it("omits a tool result whose secret sits past the retained prefix", () => {
+		const buffer = new SnapshotToolResultBuffer({ maxItems: 5, maxItemChars: 120, maxTotalChars: 800 });
+		buffer.record({ toolName: "bash", result: `${"safe log line\n".repeat(40)}${AWS_KEY_LINE}`, isError: false });
+
+		const content = buffer.toSnapshotCategoryInput()?.content ?? "";
+		assert.equal(content, `- bash (ok): ${SNAPSHOT_OMITTED_SENSITIVE_TEXT}`);
+		assert.doesNotMatch(content, /AKIA/);
+	});
+
+	it("omits a tool result whose secret sits in a late multipart text part", () => {
+		const buffer = new SnapshotToolResultBuffer({ maxItems: 5, maxItemChars: 120, maxTotalChars: 800 });
+		buffer.record({
+			toolName: "read",
+			result: {
+				content: [
+					{ type: "text", text: "head part\n".repeat(30) },
+					{ type: "text", text: PRIVATE_KEY_BLOCK },
+				],
+			},
+			isError: false,
+		});
+
+		const content = buffer.toSnapshotCategoryInput()?.content ?? "";
+		assert.equal(content, `- read (ok): ${SNAPSHOT_OMITTED_SENSITIVE_TEXT}`);
+		assert.doesNotMatch(content, /PRIVATE KEY/);
+	});
+
+
+	it("omits a generic tool-result string field whose secret sits past its rendered summary", () => {
+		const buffer = new SnapshotToolResultBuffer({ maxItems: 5, maxItemChars: 120, maxTotalChars: 800 });
+		buffer.record({
+			toolName: "custom",
+			result: { payload: `${"safe".repeat(40)}\n${AWS_KEY_LINE}` },
+			isError: false,
+		});
+
+		const content = buffer.toSnapshotCategoryInput()?.content ?? "";
+		assert.equal(content, `- custom (ok): ${SNAPSHOT_OMITTED_SENSITIVE_TEXT}`);
+		assert.doesNotMatch(JSON.stringify(buffer), /AKIA/);
+	});
+
+
+	it("omits a generic tool result when a later top-level field contains a secret", () => {
+		const buffer = new SnapshotToolResultBuffer({ maxItems: 5, maxItemChars: 120, maxTotalChars: 800 });
+		const result = Object.fromEntries([
+			...Array.from({ length: 8 }, (_, index) => [`safe${index}`, `value${index}`]),
+			["later", `PASSWORD=${"hunter2secret".repeat(2)}`],
+		]);
+		buffer.record({ toolName: "custom", result, isError: false });
+
+		const content = buffer.toSnapshotCategoryInput()?.content ?? "";
+		assert.equal(content, `- custom (ok): ${SNAPSHOT_OMITTED_SENSITIVE_TEXT}`);
+		assert.doesNotMatch(JSON.stringify(buffer), /hunter2secret/);
+	});
+
+	it("keeps a long safe tail bounded instead of omitting it", () => {
+		const buffer = new SnapshotToolResultBuffer({ maxItems: 5, maxItemChars: 120, maxTotalChars: 800 });
+		buffer.record({ toolName: "npm", result: `${"safe log line\n".repeat(40)}all tests passed`, isError: false });
+
+		const content = buffer.toSnapshotCategoryInput()?.content ?? "";
+		assert.match(content, /safe log line/);
+		assert.doesNotMatch(content, /snapshot source omitted/);
+	});
+
+	it("omits a recent user message whose secret sits past the retained prefix", () => {
+		const entries = new Map<string, unknown>([
+			[
+				"leaf",
+				{
+					type: "message",
+					id: "leaf",
+					parentId: null,
+					message: { role: "user", content: `${"please review this line\n".repeat(120)}${AWS_KEY_LINE}` },
+				},
+			],
+		]);
+
+		const input = buildRuntimeSnapshotInput({
+			question: "What now?",
+			maxContextChars: 4_000,
+			recentUserMaxChars: 500,
+			sessionManager: {
+				getLeafEntry: () => entries.get("leaf"),
+				getEntry: (id: string) => entries.get(id),
+			},
+		});
+
+		const recent = input.categories.find((item) => item.category === "recent-user-request");
+		assert.equal(recent?.content, SNAPSHOT_OMITTED_SENSITIVE_TEXT);
+		assert.doesNotMatch(JSON.stringify(input), /AKIA/);
+	});
+
+	it("omits a recent user message whose secret sits in a late multipart text part", () => {
+		const entries = new Map<string, unknown>([
+			[
+				"leaf",
+				{
+					type: "message",
+					id: "leaf",
+					parentId: null,
+					message: {
+						role: "user",
+						content: [
+							{ type: "text", text: "please review this line\n".repeat(120) },
+							{ type: "text", text: PRIVATE_KEY_BLOCK },
+						],
+					},
+				},
+			],
+		]);
+
+		const input = buildRuntimeSnapshotInput({
+			question: "What now?",
+			maxContextChars: 4_000,
+			recentUserMaxChars: 500,
+			sessionManager: {
+				getLeafEntry: () => entries.get("leaf"),
+				getEntry: (id: string) => entries.get(id),
+			},
+		});
+
+		const recent = input.categories.find((item) => item.category === "recent-user-request");
+		assert.equal(recent?.content, SNAPSHOT_OMITTED_SENSITIVE_TEXT);
+		assert.doesNotMatch(JSON.stringify(input), /PRIVATE KEY/);
+	});
+
+	it("keeps a long safe recent user message bounded instead of omitting it", () => {
+		const entries = new Map<string, unknown>([
+			[
+				"leaf",
+				{
+					type: "message",
+					id: "leaf",
+					parentId: null,
+					message: { role: "user", content: `${"please review this line\n".repeat(120)}and then ship it` },
+				},
+			],
+		]);
+
+		const input = buildRuntimeSnapshotInput({
+			question: "What now?",
+			maxContextChars: 4_000,
+			recentUserMaxChars: 500,
+			sessionManager: {
+				getLeafEntry: () => entries.get("leaf"),
+				getEntry: (id: string) => entries.get(id),
+			},
+		});
+
+		const recent = input.categories.find((item) => item.category === "recent-user-request");
+		assert.match(recent?.content ?? "", /please review this line/);
+		assert.doesNotMatch(recent?.content ?? "", /snapshot source omitted/);
+	});
+});
+
+describe("automatic snapshot truncation accounting", () => {
+	function recentUserContent(source: string | { type: string; text: string }[], maxChars: number): string {
+		const entries = new Map<string, unknown>([
+			["leaf", { type: "message", id: "leaf", parentId: null, message: { role: "user", content: source } }],
+		]);
+		const input = buildRuntimeSnapshotInput({
+			question: "q",
+			maxContextChars: 32_000,
+			recentUserMaxChars: maxChars,
+			sessionManager: {
+				getLeafEntry: () => entries.get("leaf"),
+				getEntry: (id: string) => entries.get(id),
+			},
+		});
+		return input.categories.find((item) => item.category === "recent-user-request")?.content ?? "";
+	}
+
+	function omittedCount(content: string): number {
+		const match = /\[snapshot:recent-user-request truncated (\d+) chars\]$/.exec(content);
+		assert.ok(match, `expected a truncation marker in: ${content.slice(-120)}`);
+		return Number(match[1]);
+	}
+
+	for (const cap of [500, 1_000, 5_000]) {
+		it(`reports the exact omitted char count for a single-part source at cap ${cap}`, () => {
+			const source = "x".repeat(cap * 3 + 17);
+			const content = recentUserContent(source, cap);
+
+			assert.ok(content.length <= cap, `content ${content.length} exceeded cap ${cap}`);
+			const retained = content.slice(0, content.indexOf("… [snapshot:"));
+			assert.equal(omittedCount(content), source.length - retained.length);
+		});
+
+		it(`reports the exact omitted char count for a multipart source at cap ${cap}`, () => {
+			const parts = [
+				{ type: "text", text: "a".repeat(cap) },
+				{ type: "text", text: "b".repeat(cap) },
+				{ type: "text", text: "c".repeat(cap + 3) },
+			];
+			const logicalLength = parts.map((part) => part.text).join("\n").length;
+			const content = recentUserContent(parts, cap);
+
+			assert.ok(content.length <= cap, `content ${content.length} exceeded cap ${cap}`);
+			const retained = content.slice(0, content.indexOf("… [snapshot:"));
+			assert.equal(omittedCount(content), logicalLength - retained.length);
+		});
+	}
+
+	it("keeps the truncation marker inside a tiny cap without a body", () => {
+		const content = recentUserContent("y".repeat(400), 20);
+		assert.ok(content.length <= 20, `content ${content.length} exceeded cap 20`);
+		assert.ok(content.length > 0);
+	});
+});
 
 describe("snapshot command wiring", () => {
 	it("parses snapshot prefix while preserving alias and flags", () => {

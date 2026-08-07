@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+	classifySpecialCommand,
 	mergeSettings,
 	parseAutoCommandArgs,
 	parseCommandArgs,
 } from "./helpers.ts";
+import pitaj from "./index.ts";
 
 describe("pitaj command parsing", () => {
 	it("parses /pitaj opus question text", () => {
@@ -153,5 +156,180 @@ describe("pitaj auto risk flag parsing", () => {
 
 	it("rejects an invalid risk value", () => {
 		assert.throws(() => parseAutoCommandArgs("--risk medium why?", settings), /must be 'low' or 'high'/);
+	});
+});
+
+describe("pitaj quote-aware lexer", () => {
+	const settings = mergeSettings({ aliases: { opus: "anthropic/claude-opus-4-8", gpt: "openai-codex/gpt-5.5" } });
+
+	it("treats every JavaScript whitespace separator outside quotes as a token boundary", () => {
+		const parsed = parseCommandArgs("opus\t--mode\ndebug\u00a0--brevity\rdetailed\twhy is this slow?", settings);
+		assert.equal(parsed.model, "opus");
+		assert.equal(parsed.mode, "debug");
+		assert.equal(parsed.brevity, "detailed");
+		assert.equal(parsed.question, "why is this slow?");
+	});
+
+	it("keeps whitespace inside a quoted context value", () => {
+		const parsed = parseCommandArgs('opus -c "line one\nline two" what now?', settings);
+		assert.equal(parsed.context, "line one\nline two");
+		assert.equal(parsed.question, "what now?");
+	});
+
+	it("supports escaped quotes and escaped backslashes inside a quoted value", () => {
+		const parsed = parseCommandArgs('opus -c "say \\"hi\\" then C:\\\\tmp" what now?', settings);
+		assert.equal(parsed.context, 'say "hi" then C:\\tmp');
+		assert.equal(parsed.question, "what now?");
+	});
+
+	it("never reads a quoted flag as top-level syntax", () => {
+		const parsed = parseCommandArgs('opus "--mode" debug what does it do?', settings);
+		assert.equal(parsed.mode, undefined);
+		assert.equal(parsed.question, "--mode debug what does it do?");
+	});
+
+	it("never reads a quoted alias as the model", () => {
+		const parsed = parseCommandArgs('"opus" is a model name, right?', settings);
+		assert.equal(parsed.model, undefined);
+		assert.equal(parsed.question, "opus is a model name, right?");
+	});
+
+	it("falls back deterministically on an unbalanced quote", () => {
+		const first = parseCommandArgs('opus "what is wrong here?', settings);
+		const second = parseCommandArgs('opus "what is wrong here?', settings);
+		assert.deepEqual(first, second);
+		assert.equal(first.model, "opus");
+		assert.equal(first.question, '"what is wrong here?');
+		assert.equal(first.context, undefined);
+	});
+
+	it("rejects duplicate top-level mode, brevity, and context flags", () => {
+		assert.throws(() => parseCommandArgs("opus --mode debug --mode plan which?", settings), /--mode was given more than once/);
+		assert.throws(
+			() => parseCommandArgs("opus --brevity short -b detailed which?", settings),
+			/--brevity was given more than once/,
+		);
+		assert.throws(() => parseCommandArgs("opus -c one --context two which?", settings), /--context was given more than once/);
+	});
+
+	it("rejects duplicate flags in auto commands through the same lexer", () => {
+		assert.throws(
+			() => parseAutoCommandArgs("--risk low --mode debug -m plan which?", settings),
+			/--mode was given more than once/,
+		);
+	});
+
+	it("still accepts a single quoted duplicate-looking flag as literal text", () => {
+		const parsed = parseCommandArgs('opus --mode debug "--mode" plan which?', settings);
+		assert.equal(parsed.mode, "debug");
+		assert.equal(parsed.question, "--mode plan which?");
+	});
+});
+
+describe("special command classification uses the shared lexical model", () => {
+	it("classifies subcommands separated by any whitespace", () => {
+		assert.equal(classifySpecialCommand("auto\t--risk high why?"), "auto");
+		assert.equal(classifySpecialCommand("advise\nwhy?"), "advise");
+		assert.equal(classifySpecialCommand("config\tshow"), "config");
+		assert.equal(classifySpecialCommand("usage\treset"), "usage");
+	});
+
+	it("does not classify a quoted subcommand name as a subcommand", () => {
+		assert.equal(classifySpecialCommand('"auto" what does it do?'), "none");
+		assert.equal(classifySpecialCommand('"help"'), "none");
+	});
+});
+
+type PitajCommandHandler = (args: string, ctx: ExtensionContext) => Promise<void>;
+
+/** Register the extension and return the executable `/pitaj` command handler. */
+function registeredPitajCommand(): PitajCommandHandler {
+	let handler: PitajCommandHandler | undefined;
+	const api = {
+		on() {},
+		registerTool() {},
+		sendMessage() {},
+		registerCommand(name: string, spec: { handler: PitajCommandHandler }) {
+			if (name === "pitaj") handler = spec.handler;
+		},
+	} as unknown as ExtensionAPI;
+	pitaj(api);
+	if (!handler) throw new Error("pitaj did not register its /pitaj command");
+	return handler;
+}
+
+function notifyingCtx(notes: string[]): ExtensionContext {
+	return {
+		hasUI: false,
+		ui: {
+			notify(text: string) {
+				notes.push(text);
+			},
+			setStatus() {},
+			async editor() {
+				return undefined;
+			},
+		},
+		modelRegistry: {
+			find() {
+				return undefined;
+			},
+			async getApiKeyAndHeaders() {
+				return { ok: false, error: "no credentials in this fixture" };
+			},
+		},
+	} as unknown as ExtensionContext;
+}
+
+describe("special command execution consumes the classified tokens", () => {
+	it("resets usage counters for any JavaScript whitespace separator", async () => {
+		for (const input of ["usage reset", "usage\treset", "usage\nreset", "USAGE  RESET"]) {
+			const notes: string[] = [];
+			await registeredPitajCommand()(input, notifyingCtx(notes));
+			assert.deepEqual(notes, ["pitaj usage counters reset"], `input: ${JSON.stringify(input)}`);
+		}
+	});
+
+	it("renders the usage summary for a bare usage subcommand", async () => {
+		const notes: string[] = [];
+		await registeredPitajCommand()("usage", notifyingCtx(notes));
+		assert.equal(notes.length, 1);
+		assert.match(notes[0], /pitaj usage \(current session\)/);
+	});
+
+	it("never treats a quoted reset as usage syntax", async () => {
+		const notes: string[] = [];
+		await registeredPitajCommand()('usage "reset"', notifyingCtx(notes));
+		assert.equal(notes.length, 1);
+		assert.doesNotMatch(notes[0], /counters reset/);
+		// Quoted text is an ordinary question, so it reaches the consult path.
+		assert.match(notes[0], /pitaj failed:/);
+	});
+
+	it("shows the config summary for any whitespace-separated show subcommand", async () => {
+		for (const input of ["config show", "config\tshow", "CONFIG\nSHOW"]) {
+			const notes: string[] = [];
+			await registeredPitajCommand()(input, notifyingCtx(notes));
+			assert.equal(notes.length, 1, `input: ${JSON.stringify(input)}`);
+			assert.match(notes[0], /pitaj config \(/);
+			assert.doesNotMatch(notes[0], /Unsupported \/pitaj config subcommand/, `input: ${JSON.stringify(input)}`);
+		}
+	});
+
+	it("shows the config summary without a UI for a bare config subcommand", async () => {
+		const notes: string[] = [];
+		await registeredPitajCommand()("config", notifyingCtx(notes));
+		assert.equal(notes.length, 1);
+		assert.match(notes[0], /pitaj config \(/);
+		assert.doesNotMatch(notes[0], /Unsupported \/pitaj config subcommand/);
+	});
+
+	it("reports an unsupported config subcommand, including a quoted show", async () => {
+		for (const input of ["config bogus", 'config "show"', "config show extra"]) {
+			const notes: string[] = [];
+			await registeredPitajCommand()(input, notifyingCtx(notes));
+			assert.equal(notes.length, 1, `input: ${JSON.stringify(input)}`);
+			assert.match(notes[0], /Unsupported \/pitaj config subcommand/, `input: ${JSON.stringify(input)}`);
+		}
 	});
 });

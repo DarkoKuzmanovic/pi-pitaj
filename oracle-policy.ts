@@ -10,7 +10,7 @@
  * evidence reaches the sidecar context.
  */
 
-import { isAbsolute, normalize, sep } from "node:path";
+import hostPath, { posix, win32 } from "node:path";
 
 // --- Budget constants (hard maximums; callers cannot raise these) ------------
 
@@ -149,25 +149,88 @@ export function resolveEvidenceRequestLimit(
  *
  * Returns `{ ok: true, resolved }` or `{ ok: false, reason }`.
  */
+export type PathApi = typeof posix;
+
+/**
+ * The three path implementations path-flavor selection is allowed to consider.
+ * `host` is the platform's own `node:path` at runtime; tests pass an explicit
+ * host so a Win32 or POSIX fixture behaves identically on any machine.
+ */
+export interface PathFlavorApis {
+	readonly posix: PathApi;
+	readonly win32: PathApi;
+	readonly host: PathApi;
+}
+
+export const HOST_PATH_FLAVOR_APIS: PathFlavorApis = { posix, win32, host: hostPath };
+
+const WIN32_DRIVE_ROOT = /^[A-Za-z]:[\\/]/;
+const WIN32_UNC_ROOT = /^\\\\[^\\/]/;
+
+/**
+ * Choose the path implementation for one approved root.
+ *
+ * Selection reads the host platform and the root only. An evidence candidate
+ * is untrusted model input: letting a candidate backslash flip the flavor let
+ * a POSIX filename such as `we\ird.txt` be reinterpreted as a Win32 path with
+ * separators, so a candidate is never consulted here.
+ */
+export function selectPathApi(root: string, apis: PathFlavorApis = HOST_PATH_FLAVOR_APIS): PathApi {
+	if (apis.host === apis.win32) return apis.win32;
+	const trimmedRoot = root.trim();
+	if (WIN32_DRIVE_ROOT.test(trimmedRoot) || WIN32_UNC_ROOT.test(trimmedRoot)) return apis.win32;
+	return apis.posix;
+}
+
+/** Return a root-relative candidate when it is contained, or undefined outside. */
+export function relativeRootPath(
+	root: string,
+	candidate: string,
+	allowRoot = false,
+	apis: PathFlavorApis = HOST_PATH_FLAVOR_APIS,
+): string | undefined {
+	const api = selectPathApi(root, apis);
+	const rootResolved = api.resolve(root);
+	const candidateResolved = api.resolve(candidate);
+	const pathRelative = api.relative(rootResolved, candidateResolved);
+	if (pathRelative === "") return allowRoot ? "" : undefined;
+	if (pathRelative === ".." || pathRelative.startsWith(`..${api.sep}`) || api.isAbsolute(pathRelative)) return undefined;
+	return pathRelative;
+}
+
+/** Portable lexical containment for POSIX and Win32 drive paths. */
+export function isPathWithinRoot(
+	root: string,
+	candidate: string,
+	allowRoot = false,
+	apis: PathFlavorApis = HOST_PATH_FLAVOR_APIS,
+): boolean {
+	return relativeRootPath(root, candidate, allowRoot, apis) !== undefined;
+}
+
+/** Resolve a root-relative path and reject traversal outside the root. */
 export function resolveRootRelativePath(
 	root: string,
 	relativePath: string,
+	apis: PathFlavorApis = HOST_PATH_FLAVOR_APIS,
 ): { ok: true; resolved: string } | { ok: false; reason: string } {
 	const trimmedPath = relativePath.trim();
 	if (!trimmedPath) {
 		return { ok: false, reason: "empty path" };
 	}
-	if (isAbsolute(trimmedPath)) {
+	const api = selectPathApi(root, apis);
+	// Absolute under any flavor is refused, not just the selected one: a Win32
+	// drive path handed to a POSIX root is still an escape attempt.
+	if (api.isAbsolute(trimmedPath) || posix.isAbsolute(trimmedPath) || win32.isAbsolute(trimmedPath)) {
 		return { ok: false, reason: "absolute paths are not allowed; use root-relative paths" };
 	}
 
-	const rootNorm = normalize(root);
-	const joined = normalize(`${rootNorm}${sep}${trimmedPath}`);
-
+	const rootNorm = api.normalize(root);
+	const joined = api.normalize(api.join(rootNorm, trimmedPath));
 	if (joined === rootNorm) {
 		return { ok: false, reason: "path resolves to the root itself" };
 	}
-	if (!joined.startsWith(`${rootNorm}${sep}`)) {
+	if (!isPathWithinRoot(rootNorm, joined, false, apis)) {
 		return { ok: false, reason: "path traversal outside the approved root" };
 	}
 	return { ok: true, resolved: joined };

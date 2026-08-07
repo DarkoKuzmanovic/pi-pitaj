@@ -15,7 +15,7 @@ index.ts                ← Extension entrypoint
 ├─ loadSettings()        ← Reads settings.json (safe fallback + auto-route validation warning)
 ├─ pitaj tool registration← Agent tool: `pitaj`
 ├─ /pitaj command        ← Slash command with subcommands (auto, advise, snapshot, config, usage, check)
-└─ consultModel()        ← Resolves model, validates auth, streams via `stream()`, finalizes the answer
+└─ consultModel()        ← Resolves model, validates auth, streams via `ctx.modelRegistry.getProvider(model.provider)?.streamSimple`, finalizes the answer
 
 helpers.ts              ← Pure logic: settings, parsing, prompts, formatting, usage accounting
 ├─ settingsFromUnknown() / mergeSettings() / validateAutoRouteAliases()
@@ -32,6 +32,7 @@ oracle.ts               ← Approved-root validation, bounded evidence adapter, 
 snapshot.ts             ← Pure bounded session-snapshot context builder
 snapshot-runtime.ts     ← Runtime collection seam (session tree, tool-result buffer)
 usage.ts                ← createUsageRecorder() bridging usage store to tool/command call sites
+settings-persistence.ts  ← Raw-document patching, source witnesses, fsync, and atomic compare-and-swap writes
 settings.json           ← Runtime model aliases / defaults
 ```
 
@@ -43,27 +44,31 @@ settings.json           ← Runtime model aliases / defaults
    - `pitaj <alias|provider/model> <question>`
    - or bare question using `defaultModel`.
 4. `resolveModelRef()` maps aliases to provider/model IDs.
-5. Model is resolved through `ctx.modelRegistry` and API credentials are loaded.
-6. A compact prompt is built (mode + brevity, optional context, optional truncation).
-7. `stream()` runs each consultation round; Oracle tool rounds are serially mediated by the host.
-8. After each completed `streamResponse.result()` round, real `AssistantMessage.usage` is accumulated once and returned as nested tool `usage` when available.
+5. Model is resolved through `ctx.modelRegistry`; `getApiKeyAndHeaders(model)` validates provider-scoped auth, where `ok: true` may be keyless, and `getProvider(model.provider)?.streamSimple` selects the active provider implementation.
+6. A compact prompt is built (mode + brevity, optional context, optional truncation); direct limits are validated at 1..64,000 context and 1..16,000 output characters.
+7. `provider.streamSimple` runs each consultation round with a 2,048/4,096/8,192 token ceiling for short/normal/detailed; Oracle tool rounds are serially mediated by the host.
+8. After each accepted completed `streamResponse.result()` round, real `AssistantMessage.usage` is accumulated once and returned as nested tool `usage` when available; iterator/result rejection, provider error/abort, malformed Oracle tool use, and unexpected tool use in tools-disabled rounds persist no messages, evidence, or usage.
 9. Oracle request/character exhaustion → one bounded refusal, then exactly one final round with tools omitted; `details.oracle.exhausted` is set and the display footer warns the caller.
 10. `finalizeConsultAnswer()` turns the terminal stream outcome into a final answer or a loud failure:
    - `stopReason: "error"` / `"aborted"` → throw (a dead stream is never returned as a normal answer; the error carries the provider message and partial-text size)
    - `stopReason: "length"` → answer returned but visibly marked as provider-truncated, `truncated` recorded in details
+   - unexpected `stopReason: "toolUse"` when no Oracle evidence tool is active → throw before usage acceptance
 11. Answer is returned and displayed by Pi; coarse in-memory usage counters remain separate from nested provider token/cost usage.
 
 ## Configuration
 
-`settings.json` supports:
+`settings.json` supports (finite whole-number limits, hard maxima 64,000 context and 16,000 output characters):
 
 - `defaultModel` (alias or `provider/model`)
 - `defaultMode` (`answer` | `critique` | `debug` | `plan` | `risk-check`)
 - `defaultBrevity` (`short` | `normal` | `detailed`)
-- `maxContextChars`
-- `maxOutputChars`
+- `maxContextChars` (1..64000)
+- `maxOutputChars` (1..16000)
 - `aliases` map (e.g., `opus`, `deepseek`, `glm`)
 - `autoRouteLow` / `autoRouteHigh` (alias names used by `model: "auto"` routing; validated at load time)
+
+Interactive persistence validates every known field in the patched raw document before writing. Unknown fields and raw aliases remain forward-compatible, but an invalid known field blocks an unrelated UI rewrite and requires manual repair.
+Model fields are validated semantically: the merged default and each alias must resolve through `resolveModelRef()`, normalized alias collisions are rejected, and `auto`/`advise` remain reserved alias names.
 
 Example:
 
@@ -83,20 +88,25 @@ Example:
 
 ### Oracle root, evidence, and budget invariants
 
-Oracle mode requires an explicit `oracleRoot` that equals the canonical Git top-level containing `ctx.cwd`; a different valid Git repository is rejected before the first provider request, and there is no cwd fallback or interactive approval gate. Every Git subprocess removes repository-selection variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, and `GIT_ALTERNATE_OBJECT_DIRECTORIES`) while preserving normal runtime environment such as `PATH`. Evidence stays limited to host-mediated `read_file`, `search`, `list_files`, and `git_diff`. `search` enumerates candidates through Git (`git ls-files -co --exclude-standard -z`, optionally narrowed to a root-relative directory), skips binary candidates, counts unreadable/unsafe/oversized candidates without disclosing their paths or causes, and reports candidate/match bounds or partial search instead of a bare no-match. `git_diff` means staged plus unstaged changes to tracked files: committed repositories use `git diff HEAD --no-ext-diff --no-textconv`, while unborn repositories combine cached and unstaged tracked diffs. Untracked files are excluded, all Git output shares a finite aggregate host buffer, and an oversized result becomes an explicit refusal. Its hard budget is 9 evidence requests, 4,000 characters per result, and 18,000 aggregate evidence characters per consultation; the first reached limit stops further requests. `maxEvidenceRequests` may set the request cap to a whole number from 1 through 9, never above the hard maximum; fractional and non-finite values are rejected at the schema and runtime boundaries rather than expanded. Invalid/refused requests still consume a request slot, while all existing root, traversal/symlink, sensitive-path, redaction, and read-only protections remain mandatory.
+Oracle mode requires an explicit `oracleRoot` that equals the canonical Git top-level containing `ctx.cwd`; a different valid Git repository is rejected before the first provider request, and there is no cwd fallback or interactive approval gate. Every Git subprocess removes every inherited `GIT_*` variable, then re-adds only `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `LC_ALL=C`, `GIT_CONFIG_NOSYSTEM=1`, and the platform null device for `GIT_CONFIG_GLOBAL`; argv forces `--no-optional-locks` and `-c core.fsmonitor=false`. Residual trust is explicit: this bounds Git's own configuration and repository selection but does not sandbox the process; `PATH` and the resolved Git executable remain trusted. Automatic snapshot sources are classified before retention, while explicit question/context remains opt-in and unscanned.
+
+A structurally valid Oracle tool round with an unsupported tool name receives a bounded refusal and consumes one evidence slot; it never executes an unknown host tool. Missing tool calls, and `toolUse` responses when evidence tools are disabled, are terminal protocol failures before usage acceptance.
 
 ## Testing
 
-Run focused tests or the repeatable verification gate:
+Node.js 24 or newer is required. Run focused tests or the repeatable verification gate:
 
 ```bash
+npm ci --include=dev --ignore-scripts
 npm test
 npm run typecheck
 npm run check
+npm pack --dry-run --json --ignore-scripts
+git diff --check HEAD^ HEAD
 ```
 
 - `npm test` runs the focused Node test suite.
-- `npm run typecheck` checks every root product and test `.ts` file with the strict NodeNext, no-emit configuration in `tsconfig.json`.
+- `npm run typecheck` checks every root product and test `.ts` file with the strict NodeNext, no-emit configuration in `tsconfig.json` using the pinned TypeScript 5.9.3 toolchain.
 - `npm run check` runs typecheck first, then the focused test suite.
 
 Tests cover parsing/routing, settings writes, prompt and result shaping, consultation stream behavior, snapshots, usage accounting, and Oracle policy/adapter/tool-loop boundaries.

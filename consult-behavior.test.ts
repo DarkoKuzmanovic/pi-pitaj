@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { stream } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	boundConsultContext,
@@ -12,10 +11,11 @@ import {
 	isAdviseFlagViolation,
 	mergeSettings,
 	parseCommandArgs,
+	PROVIDER_MAX_TOKENS,
 	validateAutoRouteAliases,
 	type UsageEvent,
 } from "./helpers.ts";
-import { consultModel } from "./index.ts";
+import { consultModel, type PitajStreamSimple } from "./index.ts";
 import { SNAPSHOT_CATEGORY_ORDER, SNAPSHOT_CAPTURE_POLICIES } from "./snapshot.ts";
 import { RUNTIME_CUSTOM_CATEGORIES } from "./snapshot-runtime.ts";
 
@@ -46,10 +46,26 @@ describe("finalizeConsultAnswer", () => {
 		);
 	});
 
-	it("throws on aborted", () => {
+	it("includes provider detail and partial size when aborted", () => {
 		assert.throws(
-			() => finalizeConsultAnswer({ stopReason: "aborted", rawText: "x", partialChars: 1 }, 4000),
-			/aborted/,
+			() =>
+				finalizeConsultAnswer(
+					{ stopReason: "aborted", errorMessage: "cancelled upstream", rawText: "partial", partialChars: 7 },
+					4000,
+				),
+			/aborted: cancelled upstream \(received 7 chars of partial text before failure\)/,
+		);
+		assert.throws(
+			() =>
+				finalizeConsultAnswer(
+					{ stopReason: "aborted", errorMessage: "x".repeat(2_000), rawText: "partial", partialChars: 7 },
+					4000,
+				),
+			(error: unknown) =>
+				error instanceof Error &&
+				error.message.length < 700 &&
+				/pitaj truncated/.test(error.message) &&
+				/received 7 chars/.test(error.message),
 		);
 	});
 
@@ -122,7 +138,7 @@ type FakeStreamPlan = {
 	};
 };
 
-function fakeStreamImpl(plan: FakeStreamPlan, calls: unknown[][] = []): typeof stream {
+function fakeStreamImpl(plan: FakeStreamPlan, calls: unknown[][] = []): PitajStreamSimple {
 	return ((...args: unknown[]) => {
 		calls.push(args);
 		const deltas = plan.deltas ?? [];
@@ -143,7 +159,7 @@ function fakeStreamImpl(plan: FakeStreamPlan, calls: unknown[][] = []): typeof s
 				};
 			},
 		};
-	}) as unknown as typeof stream;
+	}) as unknown as PitajStreamSimple;
 }
 
 function fakeCtx(findCalls: Array<{ provider: string; modelId: string }> = []): ExtensionContext {
@@ -180,6 +196,248 @@ const LOADED = {
 	fileState: "loaded" as const,
 };
 
+/**
+ * Context whose registry resolves an effective provider, so the default
+ * (non-injected) streaming path can be exercised end to end.
+ */
+function fakeProviderCtx(options: {
+	streamSimple?: unknown;
+	provider?: unknown;
+	auth?: { ok: boolean; apiKey?: string; headers?: Record<string, string>; error?: string };
+	getProviderCalls?: string[];
+}): ExtensionContext {
+	const providerRecord =
+		"provider" in options
+			? options.provider
+			: { id: "anthropic", streamSimple: options.streamSimple };
+	return {
+		modelRegistry: {
+			find(provider: string, modelId: string) {
+				return { provider, id: modelId };
+			},
+			getProvider(id: string) {
+				options.getProviderCalls?.push(id);
+				return providerRecord;
+			},
+			async getApiKeyAndHeaders() {
+				return options.auth ?? { ok: true, apiKey: "test-key" };
+			},
+		},
+	} as unknown as ExtensionContext;
+}
+
+describe("consultModel provider streaming boundary", () => {
+	it("streams through the effective provider resolved for the model", async () => {
+		const getProviderCalls: string[] = [];
+		const calls: unknown[][] = [];
+		const result = await consultModel(
+			{ question: "q", model: "opus" },
+			fakeProviderCtx({ streamSimple: fakeStreamImpl({ deltas: ["ok"], stopReason: "stop" }, calls), getProviderCalls }),
+			undefined,
+			LOADED,
+		);
+		assert.equal(result.answer, "ok");
+		assert.deepEqual(getProviderCalls, ["anthropic"]);
+		assert.equal(calls.length, 1);
+	});
+
+	it("fails loudly when the model's provider is not registered", async () => {
+		await assert.rejects(
+			consultModel({ question: "q", model: "opus" }, fakeProviderCtx({ provider: undefined }), undefined, LOADED),
+			/cannot reach provider "anthropic" for anthropic\/claude-opus-4-8/,
+		);
+	});
+
+	it("fails loudly when the resolved provider cannot stream", async () => {
+		await assert.rejects(
+			consultModel(
+				{ question: "q", model: "opus" },
+				fakeProviderCtx({ provider: { id: "anthropic" } }),
+				undefined,
+				LOADED,
+			),
+			/does not support streaming consultations/,
+		);
+	});
+
+	it("omits an absent apiKey instead of failing an authenticated provider", async () => {
+		const calls: unknown[][] = [];
+		const result = await consultModel(
+			{ question: "q", model: "opus" },
+			fakeProviderCtx({
+				streamSimple: fakeStreamImpl({ deltas: ["ok"], stopReason: "stop" }, calls),
+				auth: { ok: true, headers: { "x-test": "1" } },
+			}),
+			undefined,
+			LOADED,
+		);
+		assert.equal(result.answer, "ok");
+		const options = calls[0][2] as Record<string, unknown>;
+		assert.equal("apiKey" in options, false);
+		assert.deepEqual(options.headers, { "x-test": "1" });
+	});
+
+	it("fails only when auth reports not ok", async () => {
+		await assert.rejects(
+			consultModel(
+				{ question: "q", model: "opus" },
+				fakeProviderCtx({
+					streamSimple: fakeStreamImpl({ deltas: ["ok"], stopReason: "stop" }),
+					auth: { ok: false, error: "no credentials configured" },
+				}),
+				undefined,
+				LOADED,
+			),
+			/no credentials configured/,
+		);
+	});
+
+	it("requests the brevity provider token ceiling on every round", async () => {
+		for (const [brevity, expected] of Object.entries(PROVIDER_MAX_TOKENS)) {
+			const calls: unknown[][] = [];
+			await consultModel(
+				{ question: "q", model: "opus", brevity: brevity as keyof typeof PROVIDER_MAX_TOKENS },
+				fakeCtx(),
+				undefined,
+				LOADED,
+				undefined,
+				fakeStreamImpl({ deltas: ["ok"], stopReason: "stop" }, calls),
+			);
+			assert.equal((calls[0][2] as { maxTokens?: number }).maxTokens, expected);
+		}
+	});
+});
+
+describe("consultModel stream integrity", () => {
+	it("fails a round whose iterator threw even when the result reports a normal stop", async () => {
+		await assert.rejects(
+			consultModel(
+				{ question: "q", model: "opus" },
+				fakeCtx(),
+				undefined,
+				LOADED,
+				undefined,
+				fakeStreamImpl({
+					deltas: ["twelve chars"],
+					stopReason: "stop",
+					throwMidStream: new Error("socket closed"),
+				}),
+			),
+			/failed mid-stream: socket closed \(received 12 chars of partial text before failure\)/,
+		);
+	});
+
+	it("fails a round whose iterator threw even when the result reports length", async () => {
+		await assert.rejects(
+			consultModel(
+				{ question: "q", model: "opus" },
+				fakeCtx(),
+				undefined,
+				LOADED,
+				undefined,
+				fakeStreamImpl({ deltas: ["abc"], stopReason: "length", throwMidStream: new Error("socket closed") }),
+			),
+			/failed mid-stream: socket closed/,
+		);
+	});
+
+	it("does not count usage from a round whose iterator threw", async () => {
+		const usage = {
+			input: 5,
+			output: 5,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 10,
+			cost: { input: 0.05, output: 0.05, cacheRead: 0, cacheWrite: 0, total: 0.1 },
+		};
+		await assert.rejects(
+			consultModel(
+				{ question: "q", model: "opus" },
+				fakeCtx(),
+				undefined,
+				LOADED,
+				undefined,
+				fakeStreamImpl({ deltas: ["x"], stopReason: "stop", throwMidStream: new Error("boom"), usage }),
+			),
+			(error: unknown) => {
+				assert.equal((error as { usage?: unknown }).usage, undefined);
+				return /failed mid-stream: boom/.test(String(error));
+			},
+		);
+	});
+
+	it("reports the bounded partial-character count when result() rejects", async () => {
+		const rejectingStream = (() => ({
+			async *[Symbol.asyncIterator]() {
+				yield { type: "text_delta", delta: "1234567890" };
+			},
+			async result() {
+				throw new Error("result unavailable");
+			},
+		})) as unknown as PitajStreamSimple;
+		await assert.rejects(
+			consultModel({ question: "q", model: "opus" }, fakeCtx(), undefined, LOADED, undefined, rejectingStream),
+			/failed mid-stream: result unavailable \(received 10 chars of partial text before failure\)/,
+		);
+	});
+
+	it("never calls result() after the iterator throws", async () => {
+		let resultCalls = 0;
+		const throwingStream = (() => ({
+			async *[Symbol.asyncIterator]() {
+				yield { type: "text_delta", delta: "partial123" };
+				throw new Error("socket closed");
+			},
+			async result() {
+				resultCalls += 1;
+				return {
+					role: "assistant",
+					content: [{ type: "text", text: "never used" }],
+					stopReason: "stop",
+					usage: {
+						input: 9,
+						output: 9,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 18,
+						cost: { input: 0.09, output: 0.09, cacheRead: 0, cacheWrite: 0, total: 0.18 },
+					},
+				};
+			},
+		})) as unknown as PitajStreamSimple;
+
+		await assert.rejects(
+			consultModel({ question: "q", model: "opus" }, fakeCtx(), undefined, LOADED, undefined, throwingStream),
+			/failed mid-stream: socket closed \(received 10 chars of partial text before failure\)/,
+		);
+		assert.equal(resultCalls, 0, "result() must never be awaited after the iterator threw");
+	});
+
+	// The Oracle counterpart of this contract lives in oracle.test.ts, where a
+	// real approved repository root is available.
+});
+
+	it("rejects invalid direct-call character limits before opening a provider stream", async () => {
+		for (const request of [
+			{ question: "q", model: "opus", maxContextChars: 0 },
+			{ question: "q", model: "opus", maxContextChars: 64_001 },
+			{ question: "q", model: "opus", maxContextChars: 1.5 },
+			{ question: "q", model: "opus", maxOutputChars: 0 },
+			{ question: "q", model: "opus", maxOutputChars: 16_001 },
+			{ question: "q", model: "opus", maxOutputChars: Number.NaN },
+		] as const) {
+			let streamOpened = false;
+			await assert.rejects(
+				consultModel(request, fakeCtx(), undefined, LOADED, undefined, ((...args: unknown[]) => {
+					streamOpened = true;
+					const inner = fakeStreamImpl({ deltas: ["unused"], stopReason: "stop" }) as unknown as (...innerArgs: unknown[]) => unknown;
+					return inner(...args);
+				}) as unknown as PitajStreamSimple),
+				/finite whole number between/,
+			);
+			assert.equal(streamOpened, false);
+		}
+	});
 describe("consultModel behavior", () => {
 	it("returns a clean answer with resolved alias details on stopReason stop", async () => {
 		const result = await consultModel(
@@ -339,7 +597,7 @@ describe("consultModel behavior", () => {
 				assert.equal(facts.alias, undefined);
 				assert.equal(facts.routingReason, undefined);
 				assert.equal(facts.autoSuggestedMode, undefined);
-				return /requires a non-empty \"missing\" alias/.test(String(error));
+				return /requires a non-empty "missing" alias/.test(String(error));
 			},
 		);
 	});
@@ -426,7 +684,9 @@ describe("consultModel behavior", () => {
 		);
 	});
 
-	it("rejects mid-stream provider errors instead of returning partial text", async () => {
+	it("rejects a thrown mid-stream provider error with the iterator's own message", async () => {
+		// The iterator threw, so the provider's own summary of the round is never
+		// requested: the thrown error is the only trustworthy diagnostic.
 		await assert.rejects(
 			consultModel(
 				{ question: "Risks of dropping this table?", model: "opus" },
@@ -441,7 +701,54 @@ describe("consultModel behavior", () => {
 					throwMidStream: new Error("read ECONNRESET"),
 				}),
 			),
+			/failed mid-stream: read ECONNRESET \(received 35 chars of partial text/,
+		);
+	});
+
+	it("rejects a provider error round that ended without throwing, using the provider message", async () => {
+		await assert.rejects(
+			consultModel(
+				{ question: "Risks of dropping this table?", model: "opus" },
+				fakeCtx(),
+				undefined,
+				LOADED,
+				undefined,
+				fakeStreamImpl({
+					deltas: ["The main risks are: 1) data loss if"],
+					stopReason: "error",
+					errorMessage: "stream disconnected",
+				}),
+			),
 			/failed mid-stream: stream disconnected \(received 35 chars of partial text/,
+		);
+	});
+
+	it("does not aggregate usage from a provider error round", async () => {
+		await assert.rejects(
+			consultModel(
+				{ question: "q", model: "opus" },
+				fakeCtx(),
+				undefined,
+				LOADED,
+				undefined,
+				fakeStreamImpl({
+					deltas: ["partial"],
+					stopReason: "error",
+					errorMessage: "stream disconnected",
+					usage: {
+						input: 7,
+						output: 7,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 14,
+						cost: { input: 0.07, output: 0.07, cacheRead: 0, cacheWrite: 0, total: 0.14 },
+					},
+				}),
+			),
+			(error: unknown) => {
+				assert.equal((error as { usage?: unknown }).usage, undefined);
+				return /failed mid-stream: stream disconnected/.test(String(error));
+			},
 		);
 	});
 
@@ -520,6 +827,21 @@ describe("consultModel behavior", () => {
 				fakeStreamImpl({ deltas: [], stopReason: "aborted" }),
 			),
 			/aborted/,
+		);
+	});
+
+
+	it("rejects an unexpected toolUse stop in ordinary mode", async () => {
+		await assert.rejects(
+			consultModel(
+				{ question: "q", model: "opus" },
+				fakeCtx(),
+				undefined,
+				LOADED,
+				undefined,
+				fakeStreamImpl({ deltas: ["unexpected answer"], stopReason: "toolUse" }),
+			),
+			/unavailable tool|toolUse/,
 		);
 	});
 });
