@@ -14,5 +14,6 @@ Crew milestone numbers are release-oriented. Legacy PMTI identifiers remain in t
 ## Planned
 
 - **M4** — Consultation UX improvements; candidate specification: `docs/specs/ux-improvements.md`
+- **Argument completions for `/pitaj`** — complete configured aliases and `provider/model` ids from the model registry ahead of the free-text question, via `getArgumentCompletions`; add a round-trip test asserting every suggestion the completer offers is accepted by the parser.
 
 Planned entries are candidates, not authorization to implement them. Starting a milestone still requires Crew’s spec, grill offer, scope decision, and delivery choice.
