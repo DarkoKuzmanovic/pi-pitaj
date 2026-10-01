@@ -503,7 +503,7 @@ function fakeContext(
 }
 
 const LOADED = {
-	settings: mergeSettings({ aliases: { opus: "anthropic/claude-opus-4-8", gpt: "openai-codex/gpt-5.5" } }),
+	settings: mergeSettings({ aliases: { opus: "anthropic/claude-opus-4-8", gpt: "openai/gpt-5.5" } }),
 	fileState: "loaded" as const,
 };
 

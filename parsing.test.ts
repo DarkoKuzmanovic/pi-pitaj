@@ -84,7 +84,7 @@ describe("pitaj flag parsing", () => {
 });
 
 describe("pitaj auto risk flag parsing", () => {
-	const settings = mergeSettings({ aliases: { opus: "anthropic/claude-opus-4-8", gpt: "openai-codex/gpt-5.5" } });
+	const settings = mergeSettings({ aliases: { opus: "anthropic/claude-opus-4-8", gpt: "openai/gpt-5.5" } });
 
 	it("parses a top-level risk flag and keeps the question intact", () => {
 		const parsed = parseAutoCommandArgs("--risk high Is this architecture safe?", settings);
@@ -160,7 +160,7 @@ describe("pitaj auto risk flag parsing", () => {
 });
 
 describe("pitaj quote-aware lexer", () => {
-	const settings = mergeSettings({ aliases: { opus: "anthropic/claude-opus-4-8", gpt: "openai-codex/gpt-5.5" } });
+	const settings = mergeSettings({ aliases: { opus: "anthropic/claude-opus-4-8", gpt: "openai/gpt-5.5" } });
 
 	it("treats every JavaScript whitespace separator outside quotes as a token boundary", () => {
 		const parsed = parseCommandArgs("opus\t--mode\ndebug\u00a0--brevity\rdetailed\twhy is this slow?", settings);

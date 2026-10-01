@@ -68,7 +68,7 @@ describe("pitaj auto routing", () => {
 	});
 
 	it("throws when selected opus alias is blank", () => {
-		const settings = mergeSettings({ aliases: { opus: "", gpt: "openai-codex/gpt-5.5" } });
+		const settings = mergeSettings({ aliases: { opus: "", gpt: "openai/gpt-5.5" } });
 		assert.throws(
 			() => resolveAutoRoute({ risk: "high" }, settings),
 			/pitaj auto routing requires a non-empty "opus" alias/,

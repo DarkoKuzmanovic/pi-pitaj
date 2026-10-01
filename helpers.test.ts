@@ -1399,7 +1399,7 @@ describe("pitaj M3-B2 usage accounting", () => {
 			},
 			{
 				requestedModel: "auto",
-				resolvedModel: "openai-codex/gpt-5.5",
+				resolvedModel: "openai/gpt-5.5",
 				resolvedAlias: "gpt",
 				mode: "answer",
 				brevity: "short",

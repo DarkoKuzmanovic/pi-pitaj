@@ -208,14 +208,14 @@ describe("pitaj M2 config contract", () => {
 		assert.equal(settings.autoRouteLow, undefined);
 		assert.equal(settings.autoRouteHigh, undefined);
 		assert.equal(settings.defaultModel, "opus");
-		assert.equal(settings.aliases.gpt, "openai-codex/gpt-5.5");
+		assert.equal(settings.aliases.gpt, "openai/gpt-5.5");
 	});
 
 	it("does not require resolveAutoRoute alias to be a literal 'gpt' or 'opus'", () => {
 		const settings = mergeSettings({
 			autoRouteLow: "spark",
 			autoRouteHigh: "opus47",
-			aliases: { spark: "openai-codex/gpt-5.3-codex-spark", opus47: "anthropic/claude-opus-4-7" },
+			aliases: { spark: "openai/gpt-5.3-codex-spark", opus47: "anthropic/claude-opus-4-7" },
 		});
 		assert.equal(resolveAutoRoute({ risk: "low" }, settings).alias, "spark");
 		assert.equal(resolveAutoRoute({ risk: "high" }, settings).alias, "opus47");
@@ -223,7 +223,7 @@ describe("pitaj M2 config contract", () => {
 
 	it("falls back to default 'gpt' and 'opus' auto-route aliases when settings don't override", () => {
 		const settings = mergeSettings({
-			aliases: { gpt: "openai-codex/gpt-5.5", opus: "anthropic/claude-opus-4-8" },
+			aliases: { gpt: "openai/gpt-5.5", opus: "anthropic/claude-opus-4-8" },
 		});
 		assert.equal(resolveAutoRoute({ risk: "low" }, settings).alias, "gpt");
 		assert.equal(resolveAutoRoute({ risk: "high" }, settings).alias, "opus");
@@ -250,7 +250,7 @@ describe("pitaj M2 config summary and validation helpers", () => {
 		const settings = mergeSettings({
 			autoRouteLow: "gpt",
 			autoRouteHigh: "opus",
-			aliases: { gpt: "openai-codex/gpt-5.5", opus: "anthropic/claude-opus-4-8" },
+			aliases: { gpt: "openai/gpt-5.5", opus: "anthropic/claude-opus-4-8" },
 		});
 		const summary = summarizeSettings(settings, "loaded");
 		assert.equal(summary.fileState, "loaded");
@@ -281,7 +281,7 @@ describe("pitaj M2 config summary and validation helpers", () => {
 
 	it("formats the summary as a multi-line text with manual edit path", () => {
 		const settings = mergeSettings({
-			aliases: { gpt: "openai-codex/gpt-5.5", opus: "anthropic/claude-opus-4-8" },
+			aliases: { gpt: "openai/gpt-5.5", opus: "anthropic/claude-opus-4-8" },
 		});
 		const text = formatConfigSummaryText(summarizeSettings(settings, "loaded"), SETTINGS_PATH);
 		assert.match(text, /defaultModel: opus/);
@@ -395,7 +395,7 @@ describe("interactive config update helpers", () => {
 	});
 
 	it("requires auto-route targets to name existing aliases", () => {
-		const settings = mergeSettings({ aliases: { spark: "openai-codex/gpt-5.3-codex-spark" } });
+		const settings = mergeSettings({ aliases: { spark: "openai/gpt-5.3-codex-spark" } });
 		assert.equal(applyConfigUpdate(settings, "autoRouteLow", "spark").autoRouteLow, "spark");
 		assert.throws(() => applyConfigUpdate(settings, "autoRouteHigh", "missing"), /existing alias/);
 	});

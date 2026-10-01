@@ -191,7 +191,7 @@ function fakeAuthFailureCtx(message = "missing credentials"): ExtensionContext {
 
 const LOADED = {
 	settings: mergeSettings({
-		aliases: { opus: "anthropic/claude-opus-4-8", gpt: "openai-codex/gpt-5.5" },
+		aliases: { opus: "anthropic/claude-opus-4-8", gpt: "openai/gpt-5.5" },
 	}),
 	fileState: "loaded" as const,
 };
@@ -628,7 +628,7 @@ describe("consultModel behavior", () => {
 			{
 				name: "auto low",
 				request: { model: "auto", question: "q", risk: "low" as const },
-				expected: { model: "openai-codex/gpt-5.5", alias: "gpt", mode: "answer", brevity: "short", autoRouted: true, routingReason: /risk=low/ },
+				expected: { model: "openai/gpt-5.5", alias: "gpt", mode: "answer", brevity: "short", autoRouted: true, routingReason: /risk=low/ },
 			},
 			{
 				name: "auto high",
@@ -857,7 +857,7 @@ describe("validateAutoRouteAliases", () => {
 
 	it("warns when an auto-route alias is not defined", () => {
 		const settings = mergeSettings({
-			aliases: { gpt: "openai-codex/gpt-5.5" },
+			aliases: { gpt: "openai/gpt-5.5" },
 			autoRouteLow: "gtee",
 		});
 		const warning = validateAutoRouteAliases(settings);

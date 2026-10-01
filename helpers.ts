@@ -113,9 +113,9 @@ export const DEFAULT_SETTINGS: PitajSettings = {
 		opus47: "anthropic/claude-opus-4-7",
 		deepseek: "deepseek/deepseek-v4-pro",
 		glm: "zai/glm-5.1",
-		spark: "openai-codex/gpt-5.3-codex-spark",
+		spark: "openai/gpt-5.3-codex-spark",
 		mm: "minimax/MiniMax-M2.7-highspeed",
-		gpt: "openai-codex/gpt-5.5",
+		gpt: "openai/gpt-5.5",
 	},
 };
 
