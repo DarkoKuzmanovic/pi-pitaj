@@ -5,6 +5,10 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Consultations now send their system prompt, and Oracle mode its evidence tool, to the provider. `Provider.streamSimple` receives a `TranscriptContext` (messages only), so the top-level `systemPrompt`/`tools` shorthand was silently dropped: every consult ran without mode or brevity instructions, and Oracle never saw `pitaj_request_evidence`. The context is now wrapped in `normalizeContext()`, which also clears the `TS2353` typecheck error in `index.ts`. Tests assert the leading system message and current tools instead of the shorthand fields.
+
 
 ## [0.3.1] — 2026-08-07
 

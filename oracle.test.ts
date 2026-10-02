@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { PitajStreamSimple } from "./index.ts";
+import { getCurrentSystemPrompt, getCurrentTools, type Message } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { mergeSettings } from "./helpers.ts";
 import pitaj, { consultModel } from "./index.ts";
@@ -622,15 +623,23 @@ describe("Oracle serial consult loop", () => {
 		);
 		assert.equal(result.answer, "The answer is 42.");
 		assert.equal(calls.length, 2);
-		const secondContext = calls[1][1] as { messages: Array<Record<string, unknown>>; tools: Array<{ name: string }>; systemPrompt: string };
-		assert.equal(secondContext.tools.length, 1);
-		assert.equal(secondContext.tools[0].name, PITAJ_EVIDENCE_TOOL_NAME);
-		assert.match(secondContext.systemPrompt, /at most 1 evidence operations/);
-		assert.equal(secondContext.messages[1].role, "assistant");
-		assert.equal(secondContext.messages[2].role, "toolResult");
-		assert.equal(secondContext.messages[2].toolCallId, "call-1");
-		assert.equal(secondContext.messages[2].toolName, PITAJ_EVIDENCE_TOOL_NAME);
-		assert.equal(secondContext.messages[2].isError, false);
+		// Provider.streamSimple receives a TranscriptContext: the prompt and tools
+		// must ride in a leading system message, not top-level Context shorthand.
+		const secondContext = calls[1][1] as Record<string, unknown> & { messages: Array<Record<string, unknown>> };
+		assert.equal("systemPrompt" in secondContext, false);
+		assert.equal("tools" in secondContext, false);
+		const transcript = secondContext.messages as unknown as Message[];
+		const tools = getCurrentTools(transcript);
+		assert.equal(tools.length, 1);
+		assert.equal(tools[0].name, PITAJ_EVIDENCE_TOOL_NAME);
+		assert.match(getCurrentSystemPrompt(transcript), /at most 1 evidence operations/);
+		assert.equal(secondContext.messages[0].role, "system");
+		assert.equal(secondContext.messages[1].role, "user");
+		assert.equal(secondContext.messages[2].role, "assistant");
+		assert.equal(secondContext.messages[3].role, "toolResult");
+		assert.equal(secondContext.messages[3].toolCallId, "call-1");
+		assert.equal(secondContext.messages[3].toolName, PITAJ_EVIDENCE_TOOL_NAME);
+		assert.equal(secondContext.messages[3].isError, false);
 	});
 
 	it("rejects missing or invalid roots before starting a stream", async () => {
@@ -833,6 +842,7 @@ describe("Oracle serial consult loop", () => {
 
 		const finalContext = calls[2][1] as { tools?: unknown; messages: Array<Record<string, unknown>> };
 		assert.equal(finalContext.tools, undefined);
+		assert.equal(getCurrentTools(finalContext.messages as unknown as Message[]).length, 0);
 		const refusals = finalContext.messages.filter((message) => message.role === "toolResult" && message.isError === true);
 		assert.equal(refusals.length, 1);
 		assert.match(JSON.stringify(refusals[0]), /evidence budget exhausted/);
@@ -884,6 +894,7 @@ describe("Oracle serial consult loop", () => {
 			}>;
 		};
 		assert.equal(finalContext.tools, undefined);
+		assert.equal(getCurrentTools(finalContext.messages as unknown as Message[]).length, 0);
 		const persistedAssistant = finalContext.messages.find((message) => message.role === "assistant");
 		if (!persistedAssistant?.content) throw new Error("missing persisted assistant message");
 		assert.equal(persistedAssistant.content[0]?.text, "Need evidence.");
@@ -929,6 +940,7 @@ describe("Oracle serial consult loop", () => {
 		assert.equal(calls.length, 3);
 		const finalContext = calls[2][1] as { tools?: unknown; messages: Array<Record<string, unknown>> };
 		assert.equal(finalContext.tools, undefined);
+		assert.equal(getCurrentTools(finalContext.messages as unknown as Message[]).length, 0);
 		assert.equal(finalContext.messages.filter((message) => message.role === "toolResult" && message.isError === true).length, 1);
 	});
 
@@ -961,8 +973,9 @@ describe("Oracle serial consult loop", () => {
 		);
 		assert.equal(hostCalls, 1);
 		assert.equal(calls.length, 3);
-		const finalContext = calls[2][1] as { tools?: unknown };
+		const finalContext = calls[2][1] as { tools?: unknown; messages: Message[] };
 		assert.equal(finalContext.tools, undefined);
+		assert.equal(getCurrentTools(finalContext.messages).length, 0);
 	});
 
 	it("keeps auto routing and terminal length behavior in Oracle mode", async () => {

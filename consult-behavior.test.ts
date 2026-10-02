@@ -798,7 +798,16 @@ describe("consultModel behavior", () => {
 		assert.ok(result.answer.length <= 90);
 		assert.equal(result.details.answerChars, result.answer.length);
 
-		const sent = (calls[0][1] as { messages: Array<{ content: Array<{ text: string }> }> }).messages[0].content[0].text;
+		const sentContext = calls[0][1] as Record<string, unknown> & {
+			messages: Array<{ role: string; content: string | Array<{ text: string }> }>;
+		};
+		// Provider-level streams take a TranscriptContext: the consult prompt is a
+		// leading system message, never top-level Context.systemPrompt shorthand.
+		assert.equal("systemPrompt" in sentContext, false);
+		assert.equal(sentContext.messages[0].role, "system");
+		const userMessage = sentContext.messages.find((message) => message.role === "user");
+		if (!userMessage || typeof userMessage.content === "string") throw new Error("missing structured user message");
+		const sent = userMessage.content[0].text;
 		assert.ok(sent.includes(`## Context\n\n${boundedContext}`));
 		assert.ok(!sent.includes("c".repeat(200)));
 	});

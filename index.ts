@@ -5,6 +5,7 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEventStream,
 	type Message,
+	normalizeContext,
 	type Provider,
 	type ToolResultMessage,
 } from "@earendil-works/pi-ai";
@@ -522,18 +523,25 @@ export async function consultModel(
 	while (true) {
 		let streamResponse: AssistantMessageEventStream;
 		try {
+			// Provider.streamSimple sits below pi-ai's public entry points and takes
+			// a TranscriptContext (messages only). normalizeContext() folds the
+			// prompt and tool shorthand into a leading system message; without it
+			// the provider never sees them. Rebuilt each round so the evidence tool
+			// disappears once the budget is exhausted.
 			streamResponse = streamProvider(
 				model,
-				mode === "oracle"
-					? {
-						systemPrompt: buildConsultSystemPrompt(mode, brevity, maxEvidenceRequests),
-						messages,
-						...(evidenceExhausted ? {} : { tools: [PITAJ_EVIDENCE_TOOL] }),
-					}
-					: {
-						systemPrompt: buildConsultSystemPrompt(mode, brevity),
-						messages,
-					},
+				normalizeContext(
+					mode === "oracle"
+						? {
+							systemPrompt: buildConsultSystemPrompt(mode, brevity, maxEvidenceRequests),
+							messages,
+							...(evidenceExhausted ? {} : { tools: [PITAJ_EVIDENCE_TOOL] }),
+						}
+						: {
+							systemPrompt: buildConsultSystemPrompt(mode, brevity),
+							messages,
+						},
+				),
 				{
 					...requestAuth,
 					...(signal ? { signal } : {}),
